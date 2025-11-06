@@ -1,0 +1,604 @@
+import Flutter
+import UIKit
+import AVFoundation
+
+/// 轻量级原生录音插件 - iOS 实现
+/// 使用 AVAudioEngine 实现 PCM 实时回调与 WAV 文件录制
+public class PcmStreamRecorderPlugin: NSObject, FlutterPlugin {
+  private var methodChannel: FlutterMethodChannel?
+  private var eventChannel: FlutterEventChannel?
+  private var eventSink: FlutterEventSink?
+  private var routeChangeObserver: NSObjectProtocol?
+  
+  private var audioEngine: AVAudioEngine?
+  private var inputNode: AVAudioInputNode?
+  private var isRecording = false
+  private var resamplePosition: Double = 0.0
+  private var enableLog = false
+  
+  // 录音配置
+  private var sampleRate: Int = 16000
+  private var channels: Int = 1
+  private var bufferSize: Int = 1600
+  
+  // 调试计数器
+  private var sendCount: Int = 0
+
+  private func log(_ message: String) {
+    if enableLog {
+      print("[PcmStreamRecorder] \(message)")
+    }
+  }
+
+  private func configureAudioSession(sampleRate: Int) throws {
+    let audioSession = AVAudioSession.sharedInstance()
+    stopObservingRouteChanges()
+
+    var categoryOptions: AVAudioSession.CategoryOptions = [
+      .allowBluetooth,
+      .allowBluetoothA2DP,
+      .duckOthers
+    ]
+
+    try audioSession.setCategory(
+      .playAndRecord,
+      mode: .voiceChat,
+      options: categoryOptions
+    )
+    try audioSession.setActive(true)
+    try audioSession.setPreferredSampleRate(Double(sampleRate))
+
+    rerouteAudioForCurrentConfiguration()
+    startObservingRouteChanges()
+  }
+
+  private func rerouteAudioForCurrentConfiguration() {
+    let audioSession = AVAudioSession.sharedInstance()
+    applyPreferredInput(for: audioSession)
+    applyOutputRouting(for: audioSession)
+  }
+
+  private func applyPreferredInput(for audioSession: AVAudioSession) {
+    guard let inputs = audioSession.availableInputs else { return }
+
+    let preferredPortTypes: [AVAudioSession.Port] = [
+      .bluetoothHFP,
+      .bluetoothLE,
+      .headsetMic
+    ]
+
+    let selectedInput = preferredPortTypes.compactMap { portType in
+      inputs.first(where: { $0.portType == portType })
+    }.first
+
+    do {
+      try audioSession.setPreferredInput(selectedInput)
+    } catch {
+      log("设置首选输入失败: \(error.localizedDescription)")
+    }
+  }
+
+  private func applyOutputRouting(for audioSession: AVAudioSession) {
+    let outputs = audioSession.currentRoute.outputs
+    let hasExternalOutput = outputs.contains { output in
+      switch output.portType {
+      case .headphones, .bluetoothA2DP, .bluetoothHFP, .bluetoothLE:
+        return true
+      default:
+        return false
+      }
+    }
+
+    do {
+      if hasExternalOutput {
+        try audioSession.overrideOutputAudioPort(.none)
+      } else {
+        try audioSession.overrideOutputAudioPort(.speaker)
+      }
+    } catch {
+      log("调整输出路由失败: \(error.localizedDescription)")
+    }
+  }
+
+  private func startObservingRouteChanges() {
+    routeChangeObserver = NotificationCenter.default.addObserver(
+      forName: AVAudioSession.routeChangeNotification,
+      object: nil,
+      queue: .main
+    ) { [weak self] _ in
+      self?.rerouteAudioForCurrentConfiguration()
+    }
+  }
+
+  private func stopObservingRouteChanges() {
+    if let observer = routeChangeObserver {
+      NotificationCenter.default.removeObserver(observer)
+      routeChangeObserver = nil
+    }
+  }
+  
+  public static func register(with registrar: FlutterPluginRegistrar) {
+    let instance = PcmStreamRecorderPlugin()
+    
+    // MethodChannel 用于方法调用
+    let methodChannel = FlutterMethodChannel(
+      name: "pcm_stream_recorder",
+      binaryMessenger: registrar.messenger()
+    )
+    instance.methodChannel = methodChannel
+    
+    // EventChannel 用于流式传输 PCM 数据
+    let eventChannel = FlutterEventChannel(
+      name: "pcm_stream_recorder/audio_stream",
+      binaryMessenger: registrar.messenger()
+    )
+    eventChannel.setStreamHandler(instance)
+    instance.eventChannel = eventChannel
+    
+    // 注册 MethodChannel 处理器
+    registrar.addMethodCallDelegate(instance, channel: methodChannel)
+  }
+  
+  public func handle(_ call: FlutterMethodCall, result: @escaping FlutterResult) {
+    switch call.method {
+    case "checkPermission":
+      checkPermission(result: result)
+      
+    case "requestPermission":
+      requestPermission(result: result)
+      
+    case "start":
+      guard let args = call.arguments as? [String: Any] else {
+        result(FlutterError(
+          code: "INVALID_ARGUMENT",
+          message: "参数格式错误",
+          details: nil
+        ))
+        return
+      }
+      startRecording(
+        sampleRate: args["sampleRate"] as? Int ?? 16000,
+        channels: args["channels"] as? Int ?? 1,
+        bufferSize: args["bufferSize"] as? Int ?? 1600,
+        enableLog: args["enableLog"] as? Bool ?? false,
+        result: result
+      )
+      
+    case "stop":
+      stopRecording(result: result)
+      
+    case "pause":
+      pauseRecording(result: result)
+      
+    case "resume":
+      resumeRecording(result: result)
+      
+    case "isRecording":
+      result(isRecording)
+      
+    default:
+      result(FlutterMethodNotImplemented)
+    }
+  }
+  
+  /// 检查录音权限
+  private func checkPermission(result: @escaping FlutterResult) {
+    let status = AVAudioSession.sharedInstance().recordPermission
+    switch status {
+    case .granted:
+      result(true)
+    case .denied:
+      result(false)
+    case .undetermined:
+      result(false)
+    @unknown default:
+      result(false)
+    }
+  }
+  
+  /// 请求录音权限
+  private func requestPermission(result: @escaping FlutterResult) {
+    AVAudioSession.sharedInstance().requestRecordPermission { granted in
+      DispatchQueue.main.async {
+        result(granted)
+      }
+    }
+  }
+  
+  /// 开始录音
+  private func startRecording(
+    sampleRate: Int,
+    channels: Int,
+    bufferSize: Int,
+    enableLog: Bool,
+    result: @escaping FlutterResult
+  ) {
+    guard !isRecording else {
+      result(FlutterError(
+        code: "ALREADY_RECORDING",
+        message: "录音已在进行中",
+        details: nil
+      ))
+      return
+    }
+    
+    // 检查权限
+    let permissionStatus = AVAudioSession.sharedInstance().recordPermission
+    guard permissionStatus == .granted else {
+      result(FlutterError(
+        code: "PERMISSION_DENIED",
+        message: "录音权限未授予",
+        details: nil
+      ))
+      return
+    }
+    
+    self.sampleRate = sampleRate
+    self.channels = channels
+    self.bufferSize = bufferSize
+    self.enableLog = enableLog
+    self.resamplePosition = 0.0
+    
+    do {
+      // 配置音频会话：支持耳机输入输出路由
+      try configureAudioSession(sampleRate: sampleRate)
+      
+      // 创建音频引擎
+      let engine = AVAudioEngine()
+      let inputNode = engine.inputNode
+      
+      // 获取输入格式
+      let inputFormat = inputNode.inputFormat(forBus: 0)
+      
+      // 创建目标格式（16-bit PCM，指定采样率和声道数）
+      guard let targetFormat = AVAudioFormat(
+        commonFormat: .pcmFormatInt16,
+        sampleRate: Double(sampleRate),
+        channels: AVAudioChannelCount(channels),
+        interleaved: false
+      ) else {
+        result(FlutterError(
+          code: "FORMAT_ERROR",
+          message: "无法创建目标音频格式",
+          details: nil
+        ))
+        return
+      }
+      
+      // 如果采样率或声道数不匹配，需要转换
+      let needsConversion = inputFormat.sampleRate != Double(sampleRate) || 
+                           inputFormat.channelCount != AVAudioChannelCount(channels)
+      
+      if needsConversion {
+        // 安装 tap 来接收原始 PCM 数据，手动重采样为 Int16 PCM
+        inputNode.installTap(
+          onBus: 0,
+          bufferSize: AVAudioFrameCount(bufferSize * 4), // 更大的 buffer 用于转换
+          format: inputFormat
+        ) { [weak self] buffer, time in
+          guard let self = self, self.isRecording else { return }
+          self.processBufferWithResample(
+            buffer,
+            inputFormat: inputFormat,
+            targetSampleRate: targetFormat.sampleRate,
+            targetChannels: Int(targetFormat.channelCount)
+          )
+        }
+      } else {
+        // 格式匹配，直接使用
+        inputNode.installTap(
+          onBus: 0,
+          bufferSize: AVAudioFrameCount(bufferSize),
+          format: inputFormat
+        ) { [weak self] buffer, time in
+          guard let self = self, self.isRecording else { return }
+          self.sendPCMData(buffer)
+        }
+      }
+      
+      // 启动引擎
+      try engine.start()
+      
+      self.audioEngine = engine
+      self.inputNode = inputNode
+      self.isRecording = true
+      
+      log("录音已启动")
+      log("目标采样率: \(sampleRate)Hz, 声道: \(channels), 缓冲区: \(bufferSize)")
+      log("输入格式: \(inputFormat.sampleRate)Hz, \(inputFormat.channelCount)ch, \(inputFormat.commonFormat.rawValue)")
+      log("目标格式: \(targetFormat.sampleRate)Hz, \(targetFormat.channelCount)ch, \(targetFormat.commonFormat.rawValue)")
+      log("需要转换: \(needsConversion)")
+      
+      // 检查 eventSink 是否已连接（应该在 Dart 端调用 listen() 时已设置）
+      if eventSink == nil {
+        log("⚠️ 警告: eventSink 未连接，PCM 数据可能无法发送到 Flutter")
+        log("请确保在调用 start() 之前已调用 receiveBroadcastStream().listen()")
+      } else {
+        log("✅ eventSink 已连接，可以正常发送 PCM 数据")
+      }
+      
+      result(true)
+    } catch {
+      result(FlutterError(
+        code: "START_FAILED",
+        message: "启动录音失败: \(error.localizedDescription)",
+        details: error.localizedDescription
+      ))
+    }
+  }
+  
+  /// 发送 PCM 数据到 Flutter
+  private func sendPCMData(_ buffer: AVAudioPCMBuffer) {
+    let frameLength = Int(buffer.frameLength)
+    let channelCount = Int(buffer.format.channelCount)
+    
+    // 检查 buffer 格式并转换
+    var pcmData: Data
+    
+    if let int16Data = buffer.int16ChannelData {
+      // 已经是 int16 格式，直接转换为字节数组（小端序）
+      let dataSize = frameLength * channelCount * 2 // 16-bit = 2 bytes
+      pcmData = Data(count: dataSize)
+      
+      pcmData.withUnsafeMutableBytes { bytes in
+        let int16Pointer = bytes.bindMemory(to: Int16.self)
+        var index = 0
+        for frame in 0..<frameLength {
+          for channel in 0..<channelCount {
+            // 直接使用小端序（iOS 本身就是小端序）
+            int16Pointer[index] = int16Data[channel][frame]
+            index += 1
+          }
+        }
+      }
+    } else if let float32Data = buffer.floatChannelData {
+      // 需要从 float32 转换为 int16
+      let dataSize = frameLength * channelCount * 2 // 16-bit = 2 bytes
+      pcmData = Data(count: dataSize)
+      
+      pcmData.withUnsafeMutableBytes { bytes in
+        let int16Pointer = bytes.bindMemory(to: Int16.self)
+        var index = 0
+        for frame in 0..<frameLength {
+          for channel in 0..<channelCount {
+            let floatSample = float32Data[channel][frame]
+            // 限制范围 [-1.0, 1.0] 并转换为 int16
+            let clampedSample = max(-1.0, min(1.0, floatSample))
+            let int16Sample = Int16(clampedSample * 32767.0)
+            int16Pointer[index] = int16Sample
+            index += 1
+          }
+        }
+      }
+    } else {
+      // 不支持的格式
+      log("不支持的音频格式: \(buffer.format)")
+      return
+    }
+    
+    // 检查数据是否为空
+    guard pcmData.count > 0 else {
+      log("⚠️ 警告: PCM 数据为空，跳过发送")
+      return
+    }
+    
+    // EventChannel 必须在主线程调用
+    emitPCMData(pcmData)
+  }
+  
+  /// 发送 PCM 数据 (Data)
+  private func emitPCMData(_ pcmData: Data) {
+    guard !pcmData.isEmpty else { return }
+    DispatchQueue.main.async { [weak self] in
+      guard let self = self else { return }
+      guard let eventSink = self.eventSink else {
+        log("⚠️ eventSink 为 nil，数据已丢弃 (大小: \(pcmData.count) bytes)")
+        return
+      }
+      eventSink(FlutterStandardTypedData(bytes: pcmData))
+      self.sendCount += 1
+      if self.sendCount <= 5 {
+        log("✅ 已发送 PCM 数据 #\(self.sendCount)，大小: \(pcmData.count) bytes")
+      }
+    }
+  }
+  
+  /// 处理需要重采样的音频缓冲
+  private func processBufferWithResample(
+    _ buffer: AVAudioPCMBuffer,
+    inputFormat: AVAudioFormat,
+    targetSampleRate: Double,
+    targetChannels: Int
+  ) {
+    let inputFrames = Int(buffer.frameLength)
+    guard inputFrames > 0 else { return }
+    
+    let inputSampleRate = inputFormat.sampleRate
+    guard inputSampleRate > 0, targetSampleRate > 0 else { return }
+    
+    let ratio = inputSampleRate / targetSampleRate
+    guard ratio > 0 else { return }
+    
+    let channelCount = Int(inputFormat.channelCount)
+    guard channelCount > 0 else { return }
+    
+    log("🎙️ 输入帧数: \(inputFrames) (需要重采样 ratio=\(ratio))")
+    
+    var monoBuffer = [Float](repeating: 0.0, count: inputFrames)
+    if let floatChannels = buffer.floatChannelData {
+      let stride = buffer.stride
+      for ch in 0..<channelCount {
+        let channelData = floatChannels[ch]
+        for i in 0..<inputFrames {
+          monoBuffer[i] += channelData[i * stride]
+        }
+      }
+      if channelCount > 1 {
+        let inv = 1.0 / Float(channelCount)
+        for i in 0..<inputFrames {
+          monoBuffer[i] *= inv
+        }
+      }
+    } else if let int16Channels = buffer.int16ChannelData {
+      let stride = buffer.stride
+      for ch in 0..<channelCount {
+        let channelData = int16Channels[ch]
+        for i in 0..<inputFrames {
+          monoBuffer[i] += Float(channelData[i * stride]) / 32768.0
+        }
+      }
+      if channelCount > 1 {
+        let inv = 1.0 / Float(channelCount)
+        for i in 0..<inputFrames {
+          monoBuffer[i] *= inv
+        }
+      }
+    } else {
+      log("❌ 不支持的音频格式: \(inputFormat.commonFormat.rawValue)")
+      return
+    }
+    
+    var position = resamplePosition
+    var outputSamples = [Int16]()
+    outputSamples.reserveCapacity(Int(Double(inputFrames) / ratio) + 1)
+    let lastIndex = max(inputFrames - 1, 0)
+    
+    while position < Double(inputFrames) {
+      let idx = Int(position)
+      let frac = Float(position - Double(idx))
+      let nextIdx = min(idx + 1, lastIndex)
+      let current = monoBuffer[idx]
+      let next = monoBuffer[nextIdx]
+      let interpolated = current + frac * (next - current)
+      let clamped = max(-1.0, min(1.0, interpolated))
+      let sample = Int16(clamped * 32767.0)
+      outputSamples.append(sample)
+      position += ratio
+    }
+    
+    resamplePosition = position - Double(inputFrames)
+    if resamplePosition >= ratio {
+      resamplePosition.formTruncatingRemainder(dividingBy: ratio)
+    }
+    
+    if outputSamples.isEmpty {
+      log("⚠️ 重采样后无可用数据")
+      return
+    }
+    
+    let outputFrameCount = outputSamples.count
+    let outputChannels = max(targetChannels, 1)
+    let bytesPerSample = 2 // Int16
+    var maxAmplitude: Int16 = 0
+    var pcmData = Data(count: outputFrameCount * outputChannels * bytesPerSample)
+    pcmData.withUnsafeMutableBytes { rawBuffer in
+      let buffer = rawBuffer.bindMemory(to: Int16.self)
+      guard let baseAddress = buffer.baseAddress else { return }
+      for frame in 0..<outputFrameCount {
+        let sample = outputSamples[frame]
+        maxAmplitude = max(maxAmplitude, abs(sample))
+        for ch in 0..<outputChannels {
+          baseAddress[frame * outputChannels + ch] = sample
+        }
+      }
+    }
+    
+    log("✅ 重采样成功，输出帧数: \(outputFrameCount)，字节: \(pcmData.count)，最大幅度: \(maxAmplitude)")
+    emitPCMData(pcmData)
+  }
+  
+  /// 停止录音
+  private func stopRecording(result: @escaping FlutterResult) {
+    guard isRecording else {
+      result(false)
+      return
+    }
+    
+    isRecording = false
+    sendCount = 0 // 重置计数器
+    stopObservingRouteChanges()
+    
+    // 移除 tap
+    inputNode?.removeTap(onBus: 0)
+    
+    // 停止引擎
+    audioEngine?.stop()
+    audioEngine = nil
+    inputNode = nil
+    resamplePosition = 0.0
+    
+    // 恢复音频会话
+    do {
+      try AVAudioSession.sharedInstance().setActive(false, options: .notifyOthersOnDeactivation)
+    } catch {
+      // 忽略错误
+    }
+    
+    result(true)
+  }
+  
+  /// 暂停录音（iOS 不支持真正的暂停，这里停止 tap）
+  private func pauseRecording(result: @escaping FlutterResult) {
+    guard isRecording else {
+      result(false)
+      return
+    }
+    
+    inputNode?.removeTap(onBus: 0)
+    result(true)
+  }
+  
+  /// 恢复录音
+  private func resumeRecording(result: @escaping FlutterResult) {
+    guard isRecording, let engine = audioEngine, let inputNode = inputNode else {
+      result(false)
+      return
+    }
+    
+    let inputFormat = inputNode.inputFormat(forBus: 0)
+    let targetSampleRate = Double(sampleRate)
+    let targetChannels = channels
+    let needsConversion = inputFormat.sampleRate != targetSampleRate ||
+      inputFormat.channelCount != AVAudioChannelCount(targetChannels)
+
+    let tapBufferSize = needsConversion ? AVAudioFrameCount(bufferSize * 4) : AVAudioFrameCount(bufferSize)
+
+    inputNode.installTap(
+      onBus: 0,
+      bufferSize: tapBufferSize,
+      format: inputFormat
+    ) { [weak self] buffer, time in
+      guard let self = self, self.isRecording else { return }
+      if needsConversion {
+        self.processBufferWithResample(
+          buffer,
+          inputFormat: inputFormat,
+          targetSampleRate: targetSampleRate,
+          targetChannels: targetChannels
+        )
+      } else {
+        self.sendPCMData(buffer)
+      }
+    }
+    
+    result(true)
+  }
+}
+
+// MARK: - FlutterStreamHandler
+extension PcmStreamRecorderPlugin: FlutterStreamHandler {
+  public func onListen(
+    withArguments arguments: Any?,
+    eventSink events: @escaping FlutterEventSink
+  ) -> FlutterError? {
+    log("EventChannel onListen called")
+    eventSink = events
+    return nil
+  }
+  
+  public func onCancel(withArguments arguments: Any?) -> FlutterError? {
+    log("EventChannel onCancel called")
+    eventSink = nil
+    return nil
+  }
+}

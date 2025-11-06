@@ -1,0 +1,28 @@
+name: pcm_stream_recorder
+description: "轻量级原生录音插件，支持 PCM 实时回调与 WAV 文件录制"
+version: 0.0.2
+homepage:
+
+environment:
+  sdk: '>=3.3.0 <4.0.0'
+  flutter: '>=3.3.0'
+
+dependencies:
+  flutter:
+    sdk: flutter
+  plugin_platform_interface: ^2.0.2
+
+dev_dependencies:
+  flutter_test:
+    sdk: flutter
+  flutter_lints: ^6.0.0
+
+# The following section is specific to Flutter packages.
+flutter:
+  plugin:
+    platforms:
+      android:
+        package: com.yuanqu.pcm_stream_recorder
+        pluginClass: PcmStreamRecorderPlugin
+      ios:
+        pluginClass: PcmStreamRecorderPlugin
