@@ -1,7 +1,7 @@
 name: pcm_stream_recorder
 description: "轻量级原生录音插件，支持 PCM 实时回调与 WAV 文件录制"
 version: 0.0.2
-homepage:
+homepage: https://github.com/L-X-J/pcm_stream_recorder
 
 environment:
   sdk: '>=3.3.0 <4.0.0'
