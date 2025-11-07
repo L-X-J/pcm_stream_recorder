@@ -1,10 +1,15 @@
 package com.yuanqu.pcm_stream_recorder
 
+import android.content.Context
+import android.media.AudioAttributes
 import android.media.AudioFormat
+import android.media.AudioFocusRequest
+import android.media.AudioManager
 import android.media.AudioRecord
 import android.media.MediaRecorder
 import android.media.audiofx.AcousticEchoCanceler
 import android.media.audiofx.NoiseSuppressor
+import android.os.Build
 import io.flutter.embedding.engine.plugins.FlutterPlugin
 import io.flutter.plugin.common.EventChannel
 import io.flutter.plugin.common.MethodCall
@@ -24,6 +29,9 @@ class PcmStreamRecorderPlugin : FlutterPlugin, MethodCallHandler, EventChannel.S
     private var audioRecord: AudioRecord? = null
     private var isRecording = false
     private var recordingJob: Job? = null
+    private var context: Context? = null
+    private var originalAudioMode: Int = AudioManager.MODE_NORMAL
+    private var originalSpeakerphoneOn: Boolean = false
     
     // 录音配置
     private var sampleRate: Int = 16000
@@ -35,6 +43,7 @@ class PcmStreamRecorderPlugin : FlutterPlugin, MethodCallHandler, EventChannel.S
     private var noiseSuppressor: NoiseSuppressor? = null
     
     override fun onAttachedToEngine(flutterPluginBinding: FlutterPlugin.FlutterPluginBinding) {
+        context = flutterPluginBinding.applicationContext
         methodChannel = MethodChannel(flutterPluginBinding.binaryMessenger, "pcm_stream_recorder")
         methodChannel.setMethodCallHandler(this)
         
@@ -131,13 +140,38 @@ class PcmStreamRecorderPlugin : FlutterPlugin, MethodCallHandler, EventChannel.S
             
             val recordBufferSize = maxOf(bufferSize * 2, minBufferSize * 2) // 16-bit = 2 bytes
             
+            // 保存并配置音频管理器，确保不会干扰系统的音频路由
+            // 使用 MODE_IN_COMMUNICATION 以支持边播边录（播放视频同时录音）
+            val audioManager = context?.getSystemService(Context.AUDIO_SERVICE) as? AudioManager
+            if (audioManager != null) {
+                // 保存原始状态
+                originalAudioMode = audioManager.mode
+                originalSpeakerphoneOn = audioManager.isSpeakerphoneOn
+                
+                // 使用 MODE_IN_COMMUNICATION 模式以支持边播边录
+                // 这个模式允许同时播放和录音，同时不会强制切换音频路由
+                // 系统会根据连接的设备（耳机、蓝牙等）自动选择正确的路由
+                try {
+                    audioManager.mode = AudioManager.MODE_IN_COMMUNICATION
+                    // 不强制设置扬声器，让系统自动处理
+                    // 如果检测到耳机，系统会自动路由到耳机，不会切换到扬声器或听筒
+                    android.util.Log.d("PcmStreamRecorder", "音频模式已设置为 MODE_IN_COMMUNICATION，支持边播边录，保持系统自动路由")
+                } catch (e: Exception) {
+                    android.util.Log.w("PcmStreamRecorder", "设置音频模式失败: ${e.message}")
+                }
+            }
+            
             // 创建 AudioRecord (minSdk = 24，直接使用 AudioRecord.Builder)
-            // 注意：AudioRecord.Builder 不支持 setAudioAttributes()，回声消除通过 AudioSource.VOICE_COMMUNICATION 启用
+            // 注意：AudioRecord.Builder 在 API 23+ 支持 setAudioAttributes
+            // 但为了更好的兼容性和避免路由问题，我们使用 AudioSource
             val audioFormatBuilder = AudioFormat.Builder()
                 .setSampleRate(sampleRate)
                 .setEncoding(audioFormat)
                 .setChannelMask(channelConfig)
             
+            // 使用 AudioSource.VOICE_COMMUNICATION 以支持回声消除和边播边录
+            // 这个源会自动配置合适的 AudioAttributes
+            @Suppress("DEPRECATION")
             val audioRecord = AudioRecord.Builder()
                 .setAudioSource(MediaRecorder.AudioSource.VOICE_COMMUNICATION)
                 .setAudioFormat(audioFormatBuilder.build())
@@ -264,6 +298,22 @@ class PcmStreamRecorderPlugin : FlutterPlugin, MethodCallHandler, EventChannel.S
         }
         acousticEchoCanceler = null
         noiseSuppressor = null
+        
+        // 恢复音频管理器原始状态
+        // 使用协程延迟一小段时间，确保 AudioRecord 完全释放后再恢复
+        CoroutineScope(Dispatchers.Main).launch {
+            delay(100) // 延迟 100ms 确保资源完全释放
+            val audioManager = context?.getSystemService(Context.AUDIO_SERVICE) as? AudioManager
+            if (audioManager != null) {
+                try {
+                    audioManager.mode = originalAudioMode
+                    audioManager.isSpeakerphoneOn = originalSpeakerphoneOn
+                    android.util.Log.d("PcmStreamRecorder", "已恢复音频管理器原始状态: mode=$originalAudioMode, speakerphone=$originalSpeakerphoneOn")
+                } catch (e: Exception) {
+                    android.util.Log.w("PcmStreamRecorder", "恢复音频管理器状态失败: ${e.message}")
+                }
+            }
+        }
         
         return true
     }

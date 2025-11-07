@@ -23,6 +23,12 @@ public class PcmStreamRecorderPlugin: NSObject, FlutterPlugin {
   
   // 调试计数器
   private var sendCount: Int = 0
+  
+  // 保存原始音频会话状态，用于恢复
+  private var originalCategory: AVAudioSession.Category?
+  private var originalMode: AVAudioSession.Mode?
+  private var originalOptions: AVAudioSession.CategoryOptions = []
+  private var originalPreferredSampleRate: Double?
 
   private func log(_ message: String) {
     if enableLog {
@@ -33,6 +39,12 @@ public class PcmStreamRecorderPlugin: NSObject, FlutterPlugin {
   private func configureAudioSession(sampleRate: Int) throws {
     let audioSession = AVAudioSession.sharedInstance()
     stopObservingRouteChanges()
+
+    // 保存原始音频会话状态
+    originalCategory = audioSession.category
+    originalMode = audioSession.mode
+    originalOptions = audioSession.categoryOptions
+    originalPreferredSampleRate = audioSession.preferredSampleRate
 
     var categoryOptions: AVAudioSession.CategoryOptions = [
       .allowBluetooth,
@@ -79,6 +91,9 @@ public class PcmStreamRecorderPlugin: NSObject, FlutterPlugin {
   }
 
   private func applyOutputRouting(for audioSession: AVAudioSession) {
+    // 不强制覆盖音频输出路由，让系统自动处理
+    // 这样可以避免在用户使用耳机时错误地切换到扬声器或听筒
+    // 只在明确没有外部输出设备时才使用扬声器
     let outputs = audioSession.currentRoute.outputs
     let hasExternalOutput = outputs.contains { output in
       switch output.portType {
@@ -89,14 +104,19 @@ public class PcmStreamRecorderPlugin: NSObject, FlutterPlugin {
       }
     }
 
-    do {
-      if hasExternalOutput {
-        try audioSession.overrideOutputAudioPort(.none)
-      } else {
+    // 如果有外部输出设备（如耳机），完全不覆盖路由，让系统自动处理
+    // 只有在没有外部输出时才使用扬声器（用于免提通话场景）
+    if !hasExternalOutput {
+      do {
         try audioSession.overrideOutputAudioPort(.speaker)
+        log("已设置扬声器输出（无外部输出设备）")
+      } catch {
+        log("设置扬声器输出失败: \(error.localizedDescription)")
       }
-    } catch {
-      log("调整输出路由失败: \(error.localizedDescription)")
+    } else {
+      // 有外部输出时，不调用任何覆盖方法，让系统保持当前路由
+      // 这样可以确保耳机等设备正常工作，不会被错误地切换到扬声器或听筒
+      log("检测到外部输出设备，保持系统自动路由")
     }
   }
 
@@ -105,8 +125,13 @@ public class PcmStreamRecorderPlugin: NSObject, FlutterPlugin {
       forName: AVAudioSession.routeChangeNotification,
       object: nil,
       queue: .main
-    ) { [weak self] _ in
-      self?.rerouteAudioForCurrentConfiguration()
+    ) { [weak self] notification in
+      // 添加小延迟，确保系统已经完全识别到设备变化
+      // 这样可以避免在设备插入/拔出时立即处理导致的路由错误
+      DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) {
+        guard let self = self, self.isRecording else { return }
+        self.rerouteAudioForCurrentConfiguration()
+      }
     }
   }
 
@@ -527,14 +552,43 @@ public class PcmStreamRecorderPlugin: NSObject, FlutterPlugin {
     inputNode = nil
     resamplePosition = 0.0
     
-    // 恢复音频会话
-    do {
-      try AVAudioSession.sharedInstance().setActive(false, options: .notifyOthersOnDeactivation)
-    } catch {
-      // 忽略错误
-    }
+    // 恢复音频会话到原始状态
+    restoreAudioSession()
     
     result(true)
+  }
+  
+  /// 恢复音频会话到原始状态
+  private func restoreAudioSession() {
+    let audioSession = AVAudioSession.sharedInstance()
+    
+    do {
+      // 先停用音频会话
+      try audioSession.setActive(false, options: .notifyOthersOnDeactivation)
+      
+      // 恢复原始设置
+      if let originalCategory = originalCategory {
+        let originalMode = self.originalMode ?? .default
+        try audioSession.setCategory(originalCategory, mode: originalMode, options: originalOptions)
+        
+        if let originalSampleRate = originalPreferredSampleRate {
+          try audioSession.setPreferredSampleRate(originalSampleRate)
+        }
+        
+        log("已恢复音频会话到原始状态: category=\(originalCategory), mode=\(originalMode)")
+      } else {
+        // 如果没有保存的原始状态，使用默认设置
+        try audioSession.setCategory(.playback, mode: .default, options: [])
+        log("已恢复音频会话到默认状态")
+      }
+      
+      // 重新激活音频会话（如果需要）
+      // 注意：这里不强制激活，让系统根据需要自动激活
+      // try audioSession.setActive(true)
+      
+    } catch {
+      log("恢复音频会话失败: \(error.localizedDescription)")
+    }
   }
   
   /// 暂停录音（iOS 不支持真正的暂停，这里停止 tap）
