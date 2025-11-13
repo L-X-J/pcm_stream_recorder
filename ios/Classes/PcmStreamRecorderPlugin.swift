@@ -46,19 +46,81 @@ public class PcmStreamRecorderPlugin: NSObject, FlutterPlugin {
     originalOptions = audioSession.categoryOptions
     originalPreferredSampleRate = audioSession.preferredSampleRate
 
-    var categoryOptions: AVAudioSession.CategoryOptions = [
-      .allowBluetooth,
-      .allowBluetoothA2DP,
-      .duckOthers
-    ]
-
-    try audioSession.setCategory(
-      .playAndRecord,
-      mode: .voiceChat,
-      options: categoryOptions
-    )
-    try audioSession.setActive(true)
+    // 检查当前音频会话是否已经被配置（可能是 WebRTC 或其他应用配置的）
+    let currentCategory = audioSession.category
+    let currentMode = audioSession.mode
+    let currentOptions = audioSession.categoryOptions
+    
+    // 如果当前已经是 .playAndRecord 模式，尽量复用现有配置，避免与 WebRTC 冲突
+    let needsCategoryChange = currentCategory != .playAndRecord
+    
+    if needsCategoryChange {
+      // 只有在需要时才修改 category
+      // 移除 .duckOthers 选项，避免影响其他音频应用（如 WebRTC）
+      var categoryOptions: AVAudioSession.CategoryOptions = [
+        .allowBluetooth,
+        .allowBluetoothA2DP
+      ]
+      
+      // 如果当前配置中有 .mixWithOthers，保留它（WebRTC 可能使用了这个选项）
+      if currentOptions.contains(.mixWithOthers) {
+        categoryOptions.insert(.mixWithOthers)
+      }
+      
+      // 尝试使用与 WebRTC 兼容的 mode
+      // 如果当前是 .voiceChat 或 .videoChat，尽量保持，因为这些是 WebRTC 常用的模式
+      let targetMode: AVAudioSession.Mode
+      if currentMode == .voiceChat || currentMode == .videoChat {
+        targetMode = currentMode
+        log("检测到 WebRTC 兼容模式 (\(currentMode.rawValue))，保持现有模式")
+      } else {
+        targetMode = .voiceChat
+      }
+      
+      try audioSession.setCategory(
+        .playAndRecord,
+        mode: targetMode,
+        options: categoryOptions
+      )
+      log("已设置音频会话 category: .playAndRecord, mode: \(targetMode.rawValue)")
+    } else {
+      // 当前已经是 .playAndRecord，检查是否需要更新 mode
+      if currentMode != .voiceChat && currentMode != .videoChat {
+        // 如果当前 mode 不是 WebRTC 常用的模式，尝试更新
+        // 但只在必要时更新，避免中断 WebRTC
+        do {
+          try audioSession.setMode(.voiceChat)
+          log("已更新音频会话 mode 为 .voiceChat")
+        } catch {
+          log("更新 mode 失败，保持现有 mode (\(currentMode.rawValue)): \(error.localizedDescription)")
+        }
+      } else {
+        log("检测到兼容的音频会话配置，保持现有设置 (category: \(currentCategory.rawValue), mode: \(currentMode.rawValue))")
+      }
+    }
+    
+    // 使用更温和的方式激活音频会话
+    // 如果音频会话已经激活，使用 .notifyOthersOnDeactivation 选项可以避免中断其他应用
+    let isAlreadyActive = audioSession.isOtherAudioPlaying
+    if isAlreadyActive {
+      log("检测到其他音频正在播放，使用温和方式激活音频会话")
+    }
+    
+    // 尝试激活音频会话，但不强制中断其他应用
+    // 如果失败，可能是因为其他应用（如 WebRTC）正在使用音频会话
+    do {
+      try audioSession.setActive(true, options: [])
+    } catch {
+      // 如果激活失败，尝试使用 notifyOthersOnDeactivation 选项
+      // 这会在激活前通知其他应用，但不会强制中断它们
+      log("首次激活失败，尝试使用通知方式: \(error.localizedDescription)")
+      try audioSession.setActive(false, options: .notifyOthersOnDeactivation)
+      try audioSession.setActive(true, options: [])
+    }
+    
+    // 设置首选采样率（这不会强制覆盖，只是建议）
     try audioSession.setPreferredSampleRate(Double(sampleRate))
+    log("已设置首选采样率: \(sampleRate)Hz")
 
     rerouteAudioForCurrentConfiguration()
     startObservingRouteChanges()
@@ -73,6 +135,24 @@ public class PcmStreamRecorderPlugin: NSObject, FlutterPlugin {
   private func applyPreferredInput(for audioSession: AVAudioSession) {
     guard let inputs = audioSession.availableInputs else { return }
 
+    // 检查当前是否已经有首选输入（可能是 WebRTC 设置的）
+    let currentPreferredInput = audioSession.preferredInput
+    
+    // 如果已经有首选输入，并且它是我们偏好的类型之一，则保持它
+    if let preferred = currentPreferredInput {
+      let preferredTypes: [AVAudioSession.Port] = [
+        .bluetoothHFP,
+        .bluetoothLE,
+        .headsetMic,
+        .builtInMic
+      ]
+      if preferredTypes.contains(preferred.portType) {
+        log("检测到已有首选输入 (\(preferred.portType.rawValue))，保持现有设置以避免与 WebRTC 冲突")
+        return
+      }
+    }
+
+    // 只有在没有合适首选输入时才设置
     let preferredPortTypes: [AVAudioSession.Port] = [
       .bluetoothHFP,
       .bluetoothLE,
@@ -83,17 +163,20 @@ public class PcmStreamRecorderPlugin: NSObject, FlutterPlugin {
       inputs.first(where: { $0.portType == portType })
     }.first
 
-    do {
-      try audioSession.setPreferredInput(selectedInput)
-    } catch {
-      log("设置首选输入失败: \(error.localizedDescription)")
+    if let input = selectedInput {
+      do {
+        try audioSession.setPreferredInput(input)
+        log("已设置首选输入: \(input.portType.rawValue)")
+      } catch {
+        log("设置首选输入失败（可能与其他应用冲突）: \(error.localizedDescription)")
+      }
     }
   }
 
   private func applyOutputRouting(for audioSession: AVAudioSession) {
     // 不强制覆盖音频输出路由，让系统自动处理
     // 这样可以避免在用户使用耳机时错误地切换到扬声器或听筒
-    // 只在明确没有外部输出设备时才使用扬声器
+    // 同时避免与 WebRTC 的音频路由设置冲突
     let outputs = audioSession.currentRoute.outputs
     let hasExternalOutput = outputs.contains { output in
       switch output.portType {
@@ -104,15 +187,25 @@ public class PcmStreamRecorderPlugin: NSObject, FlutterPlugin {
       }
     }
 
+    // 检查当前是否有输出路由覆盖（可能是 WebRTC 设置的）
     // 如果有外部输出设备（如耳机），完全不覆盖路由，让系统自动处理
-    // 只有在没有外部输出时才使用扬声器（用于免提通话场景）
+    // 这样可以确保耳机等设备正常工作，不会被错误地切换到扬声器或听筒
+    // 同时避免覆盖 WebRTC 可能已经设置的音频路由
     if !hasExternalOutput {
+      // 只有在没有外部输出设备时才考虑设置扬声器
+      // 但也要小心，因为 WebRTC 可能已经设置了输出路由
+      // 这里我们尽量不覆盖，让系统或 WebRTC 管理
+      log("无外部输出设备，但保持系统自动路由以避免与 WebRTC 冲突")
+      // 注释掉强制设置扬声器的代码，让系统自动处理
+      // 如果需要扬声器输出，应该由应用层或 WebRTC 来管理
+      /*
       do {
         try audioSession.overrideOutputAudioPort(.speaker)
         log("已设置扬声器输出（无外部输出设备）")
       } catch {
         log("设置扬声器输出失败: \(error.localizedDescription)")
       }
+      */
     } else {
       // 有外部输出时，不调用任何覆盖方法，让系统保持当前路由
       // 这样可以确保耳机等设备正常工作，不会被错误地切换到扬声器或听筒
@@ -247,6 +340,34 @@ public class PcmStreamRecorderPlugin: NSObject, FlutterPlugin {
       return
     }
     
+    // 验证参数有效性
+    guard sampleRate > 0 else {
+      result(FlutterError(
+        code: "INVALID_ARGUMENT",
+        message: "采样率必须大于 0，当前值: \(sampleRate)",
+        details: nil
+      ))
+      return
+    }
+    
+    guard channels == 1 || channels == 2 else {
+      result(FlutterError(
+        code: "INVALID_ARGUMENT",
+        message: "声道数必须为 1（单声道）或 2（立体声），当前值: \(channels)",
+        details: nil
+      ))
+      return
+    }
+    
+    guard bufferSize > 0 else {
+      result(FlutterError(
+        code: "INVALID_ARGUMENT",
+        message: "缓冲区大小必须大于 0，当前值: \(bufferSize)",
+        details: nil
+      ))
+      return
+    }
+    
     // 检查权限
     let permissionStatus = AVAudioSession.sharedInstance().recordPermission
     guard permissionStatus == .granted else {
@@ -276,6 +397,7 @@ public class PcmStreamRecorderPlugin: NSObject, FlutterPlugin {
       let inputFormat = inputNode.inputFormat(forBus: 0)
       
       // 创建目标格式（16-bit PCM，指定采样率和声道数）
+      // 注意：即使参数已验证，AVAudioFormat 仍可能因系统限制而创建失败
       guard let targetFormat = AVAudioFormat(
         commonFormat: .pcmFormatInt16,
         sampleRate: Double(sampleRate),
@@ -284,8 +406,8 @@ public class PcmStreamRecorderPlugin: NSObject, FlutterPlugin {
       ) else {
         result(FlutterError(
           code: "FORMAT_ERROR",
-          message: "无法创建目标音频格式",
-          details: nil
+          message: "无法创建目标音频格式：采样率=\(sampleRate)Hz, 声道数=\(channels)。请检查参数是否在系统支持的范围内。",
+          details: "sampleRate: \(sampleRate), channels: \(channels)"
         ))
         return
       }
@@ -293,6 +415,10 @@ public class PcmStreamRecorderPlugin: NSObject, FlutterPlugin {
       // 如果采样率或声道数不匹配，需要转换
       let needsConversion = inputFormat.sampleRate != Double(sampleRate) || 
                            inputFormat.channelCount != AVAudioChannelCount(channels)
+      
+      // 确保在安装新 tap 之前移除可能存在的旧 tap
+      // 这可以防止在重新启动录音时出现 "Tap already exists" 错误
+      inputNode.removeTap(onBus: 0)
       
       if needsConversion {
         // 安装 tap 来接收原始 PCM 数据，手动重采样为 Int16 PCM
@@ -559,35 +685,80 @@ public class PcmStreamRecorderPlugin: NSObject, FlutterPlugin {
   }
   
   /// 恢复音频会话到原始状态
+  /// 注意：此方法会尽量恢复原始状态，但如果 WebRTC 或其他应用正在使用音频会话，
+  /// 可能会失败。这是正常的，不会影响其他应用的使用。
   private func restoreAudioSession() {
     let audioSession = AVAudioSession.sharedInstance()
     
     do {
-      // 先停用音频会话
+      // 先停用音频会话，使用 .notifyOthersOnDeactivation 通知其他应用（如 WebRTC）
+      // 这样可以让其他应用知道它们可以重新激活音频会话
       try audioSession.setActive(false, options: .notifyOthersOnDeactivation)
       
       // 恢复原始设置
       if let originalCategory = originalCategory {
         let originalMode = self.originalMode ?? .default
-        try audioSession.setCategory(originalCategory, mode: originalMode, options: originalOptions)
         
-        if let originalSampleRate = originalPreferredSampleRate {
-          try audioSession.setPreferredSampleRate(originalSampleRate)
+        // 检查当前音频会话是否已经被其他应用（如 WebRTC）重新配置
+        // 如果已经被重新配置，我们尽量不覆盖，避免干扰其他应用
+        let currentCategory = audioSession.category
+        if currentCategory != originalCategory {
+          // 当前 category 与原始不同，可能是其他应用（如 WebRTC）已经重新配置
+          // 尝试恢复，但如果失败（可能因为其他应用正在使用），则记录日志但不抛出错误
+          do {
+            try audioSession.setCategory(originalCategory, mode: originalMode, options: originalOptions)
+            log("已恢复音频会话到原始状态: category=\(originalCategory), mode=\(originalMode)")
+          } catch {
+            log("恢复音频会话 category 失败（可能被其他应用占用，如 WebRTC）: \(error.localizedDescription)")
+            // 不抛出错误，让其他应用继续使用音频会话
+          }
+        } else {
+          // category 相同，只恢复 mode 和 options（如果需要）
+          if audioSession.mode != originalMode || audioSession.categoryOptions != originalOptions {
+            do {
+              try audioSession.setMode(originalMode)
+              // 注意：setCategory 会同时设置 options，所以如果 mode 相同但 options 不同，需要重新设置 category
+              if audioSession.categoryOptions != originalOptions {
+                try audioSession.setCategory(originalCategory, mode: originalMode, options: originalOptions)
+              }
+              log("已恢复音频会话 mode 和 options")
+            } catch {
+              log("恢复音频会话 mode/options 失败: \(error.localizedDescription)")
+            }
+          } else {
+            log("音频会话已经是原始状态，无需恢复")
+          }
         }
         
-        log("已恢复音频会话到原始状态: category=\(originalCategory), mode=\(originalMode)")
+        if let originalSampleRate = originalPreferredSampleRate {
+          do {
+            try audioSession.setPreferredSampleRate(originalSampleRate)
+            log("已恢复首选采样率: \(originalSampleRate)Hz")
+          } catch {
+            log("恢复首选采样率失败: \(error.localizedDescription)")
+          }
+        }
       } else {
-        // 如果没有保存的原始状态，使用默认设置
-        try audioSession.setCategory(.playback, mode: .default, options: [])
-        log("已恢复音频会话到默认状态")
+        // 如果没有保存的原始状态，尝试设置为默认设置
+        // 但只在当前不是 .playAndRecord 时才设置（避免覆盖 WebRTC 的配置）
+        if audioSession.category != .playAndRecord {
+          do {
+            try audioSession.setCategory(.playback, mode: .default, options: [])
+            log("已恢复音频会话到默认状态")
+          } catch {
+            log("恢复音频会话到默认状态失败（可能被其他应用占用）: \(error.localizedDescription)")
+          }
+        } else {
+          log("检测到 .playAndRecord category（可能是 WebRTC 使用），保持现有配置")
+        }
       }
       
-      // 重新激活音频会话（如果需要）
-      // 注意：这里不强制激活，让系统根据需要自动激活
-      // try audioSession.setActive(true)
+      // 不强制重新激活音频会话，让系统或其他应用（如 WebRTC）根据需要激活
+      // 这样可以避免干扰其他应用的音频会话管理
       
     } catch {
-      log("恢复音频会话失败: \(error.localizedDescription)")
+      log("恢复音频会话失败（可能被其他应用占用，如 WebRTC）: \(error.localizedDescription)")
+      // 不抛出错误，让其他应用继续使用音频会话
     }
   }
   
@@ -609,6 +780,16 @@ public class PcmStreamRecorderPlugin: NSObject, FlutterPlugin {
       return
     }
     
+    // 验证参数有效性（防止在恢复时使用无效参数）
+    guard sampleRate > 0 && (channels == 1 || channels == 2) else {
+      result(FlutterError(
+        code: "INVALID_STATE",
+        message: "录音状态异常：采样率=\(sampleRate)Hz, 声道数=\(channels)。请重新启动录音。",
+        details: nil
+      ))
+      return
+    }
+    
     let inputFormat = inputNode.inputFormat(forBus: 0)
     let targetSampleRate = Double(sampleRate)
     let targetChannels = channels
@@ -616,6 +797,10 @@ public class PcmStreamRecorderPlugin: NSObject, FlutterPlugin {
       inputFormat.channelCount != AVAudioChannelCount(targetChannels)
 
     let tapBufferSize = needsConversion ? AVAudioFrameCount(bufferSize * 4) : AVAudioFrameCount(bufferSize)
+
+    // 确保在安装新 tap 之前移除可能存在的旧 tap
+    // 这可以防止在恢复录音时出现 "Tap already exists" 错误
+    inputNode.removeTap(onBus: 0)
 
     inputNode.installTap(
       onBus: 0,
