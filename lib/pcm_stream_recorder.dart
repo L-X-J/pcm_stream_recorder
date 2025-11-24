@@ -60,6 +60,9 @@ class PcmStreamRecorder {
     int channels = 1,
     int bufferSize = 1600,
     bool enableLog = false,
+    bool useSystemAEC = false,
+    bool webrtcCompatible = true,
+    bool allowA2DP = false,
   }) async {
     try {
       _enableLog = enableLog;
@@ -92,6 +95,9 @@ class PcmStreamRecorder {
           if (_enableLog && receiveCount <= 5) {
             _log('📥 Dart 端收到 PCM 数据 #$receiveCount，大小: ${data.length} bytes');
           }
+          if (_streamController == null) {
+            return;
+          }
           // 将数据转发到 StreamController
           if (!_streamController!.isClosed) {
             _streamController!.add(data);
@@ -101,6 +107,9 @@ class PcmStreamRecorder {
           if (_enableLog) {
             _log('❌ EventChannel 错误: $error');
           }
+          if (_streamController == null) {
+            return;
+          }
           // 转发错误
           if (!_streamController!.isClosed) {
             _streamController!.addError(error);
@@ -109,6 +118,9 @@ class PcmStreamRecorder {
         onDone: () {
           if (_enableLog) {
             _log('✅ EventChannel stream 已完成');
+          }
+          if (_streamController == null) {
+            return;
           }
           // 转发完成事件
           if (!_streamController!.isClosed) {
@@ -128,6 +140,9 @@ class PcmStreamRecorder {
         'channels': channels,
         'bufferSize': bufferSize,
         'enableLog': enableLog,
+        'useSystemAEC': useSystemAEC,
+        'webrtcCompatible': webrtcCompatible,
+        'allowA2DP': allowA2DP,
       });
 
       if (result != true) {
@@ -151,6 +166,7 @@ class PcmStreamRecorder {
   /// 停止录音
   Future<bool> stop() async {
     try {
+      print("pcm_stream_recorder--->stop");
       _audioSubscription?.cancel();
       _audioSubscription = null;
       _tempSubscription?.cancel();
@@ -170,6 +186,7 @@ class PcmStreamRecorder {
   /// 注意：iOS 平台不支持真正的暂停，会停止数据采集
   Future<bool> pause() async {
     try {
+      print("pcm_stream_recorder--->pause");
       final result = await _methodChannel.invokeMethod<bool>('pause');
       return result ?? false;
     } catch (e) {
@@ -180,7 +197,35 @@ class PcmStreamRecorder {
   /// 恢复录音
   Future<bool> resume() async {
     try {
+      print("pcm_stream_recorder--->resume");
       final result = await _methodChannel.invokeMethod<bool>('resume');
+      return result ?? false;
+    } catch (e) {
+      return false;
+    }
+  }
+
+  static Future<bool> deactivateSession() async {
+    try {
+      final result = await _methodChannel.invokeMethod<bool>('deactivateSession');
+      return result ?? false;
+    } catch (e) {
+      return false;
+    }
+  }
+
+  static Future<bool> prepareAudioSession() async {
+    try {
+      final result = await _methodChannel.invokeMethod<bool>('prepareAudioSession');
+      return result ?? false;
+    } catch (e) {
+      return false;
+    }
+  }
+
+  static Future<bool> restoreAudioSession() async {
+    try {
+      final result = await _methodChannel.invokeMethod<bool>('restoreAudioSession');
       return result ?? false;
     } catch (e) {
       return false;
