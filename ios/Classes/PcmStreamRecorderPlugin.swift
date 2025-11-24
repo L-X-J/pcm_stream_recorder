@@ -62,6 +62,44 @@ public class PcmStreamRecorderPlugin: NSObject, FlutterPlugin {
     }
   }
   
+  private func needsConversion(for format: AVAudioFormat) -> Bool {
+    return format.sampleRate != Double(sampleRate) ||
+      format.channelCount != AVAudioChannelCount(channels)
+  }
+  
+  private func tapBufferSize(for format: AVAudioFormat) -> AVAudioFrameCount {
+    return needsConversion(for: format)
+      ? AVAudioFrameCount(bufferSize * 4)
+      : AVAudioFrameCount(bufferSize)
+  }
+  
+  private func handleTapBuffer(_ buffer: AVAudioPCMBuffer) {
+    let format = buffer.format
+    if needsConversion(for: format) {
+      processBufferWithResample(
+        buffer,
+        inputFormat: format,
+        targetSampleRate: Double(sampleRate),
+        targetChannels: channels
+      )
+    } else {
+      sendPCMData(buffer)
+    }
+  }
+  
+  private func installTap(on inputNode: AVAudioInputNode) {
+    let formatForSizing = inputNode.inputFormat(forBus: 0)
+    let size = tapBufferSize(for: formatForSizing)
+    inputNode.installTap(
+      onBus: 0,
+      bufferSize: size,
+      format: nil
+    ) { [weak self] buffer, _ in
+      guard let self = self, self.isRecording else { return }
+      self.handleTapBuffer(buffer)
+    }
+  }
+  
   public static func register(with registrar: FlutterPluginRegistrar) {
     let instance = PcmStreamRecorderPlugin()
     
@@ -222,21 +260,12 @@ public class PcmStreamRecorderPlugin: NSObject, FlutterPlugin {
     self.resamplePosition = 0.0
     
     do {
-      // 创建音频引擎
-      let engine = AVAudioEngine()
-      let inputNode = engine.inputNode
-      
-      // 获取输入格式
-      let inputFormat = inputNode.inputFormat(forBus: 0)
-      
-      // 创建目标格式（16-bit PCM，指定采样率和声道数）
-      // 注意：即使参数已验证，AVAudioFormat 仍可能因系统限制而创建失败
-      guard let targetFormat = AVAudioFormat(
+      guard AVAudioFormat(
         commonFormat: .pcmFormatInt16,
         sampleRate: Double(sampleRate),
         channels: AVAudioChannelCount(channels),
         interleaved: false
-      ) else {
+      ) != nil else {
         result(FlutterError(
           code: "FORMAT_ERROR",
           message: "无法创建目标音频格式：采样率=\(sampleRate)Hz, 声道数=\(channels)。请检查参数是否在系统支持的范围内。",
@@ -245,42 +274,13 @@ public class PcmStreamRecorderPlugin: NSObject, FlutterPlugin {
         return
       }
       
-      // 如果采样率或声道数不匹配，需要转换
-      let needsConversion = inputFormat.sampleRate != Double(sampleRate) || 
-                           inputFormat.channelCount != AVAudioChannelCount(channels)
+      let engine = AVAudioEngine()
+      let inputNode = engine.inputNode
+      let inputFormat = inputNode.inputFormat(forBus: 0)
       
-      // 确保在安装新 tap 之前移除可能存在的旧 tap
-      // 这可以防止在重新启动录音时出现 "Tap already exists" 错误
       inputNode.removeTap(onBus: 0)
+      installTap(on: inputNode)
       
-      if needsConversion {
-        // 安装 tap 来接收原始 PCM 数据，手动重采样为 Int16 PCM
-        inputNode.installTap(
-          onBus: 0,
-          bufferSize: AVAudioFrameCount(bufferSize * 4), // 更大的 buffer 用于转换
-          format: inputFormat
-        ) { [weak self] buffer, time in
-          guard let self = self, self.isRecording else { return }
-          self.processBufferWithResample(
-            buffer,
-            inputFormat: inputFormat,
-            targetSampleRate: targetFormat.sampleRate,
-            targetChannels: Int(targetFormat.channelCount)
-          )
-        }
-      } else {
-        // 格式匹配，直接使用
-        inputNode.installTap(
-          onBus: 0,
-          bufferSize: AVAudioFrameCount(bufferSize),
-          format: inputFormat
-        ) { [weak self] buffer, time in
-          guard let self = self, self.isRecording else { return }
-          self.sendPCMData(buffer)
-        }
-      }
-      
-      // 启动引擎
       try engine.start()
       
       self.audioEngine = engine
@@ -290,10 +290,8 @@ public class PcmStreamRecorderPlugin: NSObject, FlutterPlugin {
       log("录音已启动")
       log("目标采样率: \(sampleRate)Hz, 声道: \(channels), 缓冲区: \(bufferSize)")
       log("输入格式: \(inputFormat.sampleRate)Hz, \(inputFormat.channelCount)ch, \(inputFormat.commonFormat.rawValue)")
-      log("目标格式: \(targetFormat.sampleRate)Hz, \(targetFormat.channelCount)ch, \(targetFormat.commonFormat.rawValue)")
-      log("需要转换: \(needsConversion)")
+      log("需要转换: \(needsConversion(for: inputFormat))")
       
-      // 检查 eventSink 是否已连接（应该在 Dart 端调用 listen() 时已设置）
       if eventSink == nil {
         log("⚠️ 警告: eventSink 未连接，PCM 数据可能无法发送到 Flutter")
         log("请确保在调用 start() 之前已调用 receiveBroadcastStream().listen()")
@@ -640,50 +638,15 @@ public class PcmStreamRecorderPlugin: NSObject, FlutterPlugin {
       return
     }
     
-    let inputFormat = inputNode.inputFormat(forBus: 0)
-    let targetSampleRate = Double(sampleRate)
-    let targetChannels = channels
-    let needsConversion = inputFormat.sampleRate != targetSampleRate ||
-      inputFormat.channelCount != AVAudioChannelCount(targetChannels)
-
-    let tapBufferSize = needsConversion ? AVAudioFrameCount(bufferSize * 4) : AVAudioFrameCount(bufferSize)
-
-    // 确保在安装新 tap 之前移除可能存在的旧 tap
-    // 这可以防止在恢复录音时出现 "Tap already exists" 错误
     inputNode.removeTap(onBus: 0)
-
-    inputNode.installTap(
-      onBus: 0,
-      bufferSize: tapBufferSize,
-      format: inputFormat
-    ) { [weak self] buffer, time in
-      guard let self = self, self.isRecording else { return }
-      if needsConversion {
-        self.processBufferWithResample(
-          buffer,
-          inputFormat: inputFormat,
-          targetSampleRate: targetSampleRate,
-          targetChannels: targetChannels
-        )
-      } else {
-        self.sendPCMData(buffer)
-      }
-    }
+    installTap(on: inputNode)
     
     result(true)
   }
 
   private func reconfigureInputTap() {
     guard isRecording, let inputNode = inputNode else { return }
-    let inputFormat = inputNode.inputFormat(forBus: 0)
-    let targetSampleRate = Double(sampleRate)
-    let targetChannels = channels
-    let needsConversion = inputFormat.sampleRate != targetSampleRate ||
-      inputFormat.channelCount != AVAudioChannelCount(targetChannels)
-
-    let tapBufferSize = needsConversion ? AVAudioFrameCount(bufferSize * 4) : AVAudioFrameCount(bufferSize)
     inputNode.removeTap(onBus: 0)
-    // 为适配蓝牙路由切换，重启并重置引擎
     do {
       try audioEngine?.start()
     } catch {
@@ -694,25 +657,10 @@ public class PcmStreamRecorderPlugin: NSObject, FlutterPlugin {
         log("已在路由变更后重启音频引擎")
       } catch {
         log("重启音频引擎失败: \(error.localizedDescription)")
+        return
       }
     }
-    inputNode.installTap(
-      onBus: 0,
-      bufferSize: tapBufferSize,
-      format: inputFormat
-    ) { [weak self] buffer, time in
-      guard let self = self, self.isRecording else { return }
-      if needsConversion {
-        self.processBufferWithResample(
-          buffer,
-          inputFormat: inputFormat,
-          targetSampleRate: targetSampleRate,
-          targetChannels: targetChannels
-        )
-      } else {
-        self.sendPCMData(buffer)
-      }
-    }
+    installTap(on: inputNode)
   }
 }
 
