@@ -29,10 +29,62 @@ public class PcmStreamRecorderPlugin: NSObject, FlutterPlugin {
   private let stopQueue = DispatchQueue(label: "pcm.recorder.stop", qos: .userInitiated)
   private static let deactivateQueue = DispatchQueue(label: "pcm.recorder.deactivate", qos: .userInitiated)
   private static let sessionQueue = DispatchQueue(label: "pcm.recorder.session", qos: .userInitiated)
+  private static let targetSampleRate: Double = 16000
   private static var savedCategory: AVAudioSession.Category?
   private static var savedMode: AVAudioSession.Mode?
   private static var savedOptions: AVAudioSession.CategoryOptions = []
   private static var savedPreferredSampleRate: Double?
+  
+  private static func captureOriginalSessionIfNeeded(_ session: AVAudioSession) {
+    guard savedCategory == nil else { return }
+    savedCategory = session.category
+    savedMode = session.mode
+    savedOptions = session.categoryOptions
+    savedPreferredSampleRate = session.preferredSampleRate
+  }
+  
+  private static func desiredAsrOptions(for session: AVAudioSession) -> AVAudioSession.CategoryOptions {
+    var options: AVAudioSession.CategoryOptions = [.allowBluetooth]
+    if savedOptions.contains(.mixWithOthers) || session.categoryOptions.contains(.mixWithOthers) {
+      options.insert(.mixWithOthers)
+    }
+    return options
+  }
+  
+  private static func options(_ current: AVAudioSession.CategoryOptions, include target: AVAudioSession.CategoryOptions) -> Bool {
+    return target.rawValue & ~current.rawValue == 0
+  }
+  
+  private static func sampleRateMatches(_ current: Double, target: Double) -> Bool {
+    guard current > 0 else { return false }
+    return abs(current - target) < 1.0
+  }
+  
+  private static func configureAsrSessionIfNeeded(_ session: AVAudioSession) throws -> Bool {
+    captureOriginalSessionIfNeeded(session)
+    let targetOptions = desiredAsrOptions(for: session)
+    
+    let alreadyCategory = session.category == .playAndRecord
+    let alreadyMode = session.mode == .voiceChat
+    let optionsSatisfied = options(session.categoryOptions, include: targetOptions)
+    let rateSatisfied = sampleRateMatches(session.preferredSampleRate, target: targetSampleRate)
+    
+    if alreadyCategory && alreadyMode && optionsSatisfied && rateSatisfied {
+      return false
+    }
+    
+    if !alreadyCategory || !alreadyMode || !optionsSatisfied {
+      try session.setCategory(.playAndRecord, mode: .voiceChat, options: targetOptions)
+    }
+    if !rateSatisfied {
+      try session.setPreferredSampleRate(targetSampleRate)
+    }
+    return true
+  }
+  
+  private static func activationOptions(for session: AVAudioSession) -> AVAudioSession.SetActiveOptions {
+    return session.isOtherAudioPlaying ? [.notifyOthersOnDeactivation] : []
+  }
 
   private func log(_ message: String) {
     if enableLog {
@@ -158,6 +210,9 @@ public class PcmStreamRecorderPlugin: NSObject, FlutterPlugin {
     
     case "restoreAudioSession":
       PcmStreamRecorderPlugin.restoreAudioSession(result: result)
+    
+    case "switchToAsrSession":
+      PcmStreamRecorderPlugin.switchToAsrSession(result: result)
       
     case "pause":
       pauseRecording(result: result)
@@ -559,19 +614,10 @@ public class PcmStreamRecorderPlugin: NSObject, FlutterPlugin {
     sessionQueue.async {
       let audioSession = AVAudioSession.sharedInstance()
       do {
-        if savedCategory == nil {
-          savedCategory = audioSession.category
-          savedMode = audioSession.mode
-          savedOptions = audioSession.categoryOptions
-          savedPreferredSampleRate = audioSession.preferredSampleRate
+        let changed = try configureAsrSessionIfNeeded(audioSession)
+        if changed {
+          try audioSession.setActive(true, options: activationOptions(for: audioSession))
         }
-        var options: AVAudioSession.CategoryOptions = [.allowBluetooth]
-        if savedOptions.contains(.mixWithOthers) {
-          options.insert(.mixWithOthers)
-        }
-        try audioSession.setCategory(.playAndRecord, mode: .voiceChat, options: options)
-        try audioSession.setPreferredSampleRate(16000)
-        try audioSession.setActive(true, options: [])
         DispatchQueue.main.async { result(true) }
       } catch {
         DispatchQueue.main.async {
@@ -589,8 +635,13 @@ public class PcmStreamRecorderPlugin: NSObject, FlutterPlugin {
         if let category = savedCategory {
           let mode = savedMode ?? .default
           let options = savedOptions
-          try audioSession.setCategory(category, mode: mode, options: options)
-          if let preferredRate = savedPreferredSampleRate {
+          if audioSession.category != category ||
+            audioSession.mode != mode ||
+            audioSession.categoryOptions != options {
+            try audioSession.setCategory(category, mode: mode, options: options)
+          }
+          if let preferredRate = savedPreferredSampleRate, preferredRate > 0,
+            !sampleRateMatches(audioSession.preferredSampleRate, target: preferredRate) {
             try? audioSession.setPreferredSampleRate(preferredRate)
           }
           savedCategory = nil
@@ -598,12 +649,33 @@ public class PcmStreamRecorderPlugin: NSObject, FlutterPlugin {
           savedOptions = []
           savedPreferredSampleRate = nil
         } else {
-          try audioSession.setCategory(.playback, mode: .default, options: [])
+          if audioSession.category != .playback ||
+            audioSession.mode != .default ||
+            audioSession.categoryOptions != [] {
+            try audioSession.setCategory(.playback, mode: .default, options: [])
+          }
         }
         DispatchQueue.main.async { result(true) }
       } catch {
         DispatchQueue.main.async {
           result(FlutterError(code: "RESTORE_SESSION_FAILED", message: error.localizedDescription, details: error.localizedDescription))
+        }
+      }
+    }
+  }
+
+  public static func switchToAsrSession(result: @escaping FlutterResult) {
+    sessionQueue.async {
+      let audioSession = AVAudioSession.sharedInstance()
+      do {
+        let changed = try configureAsrSessionIfNeeded(audioSession)
+        if changed {
+          try audioSession.setActive(true, options: activationOptions(for: audioSession))
+        }
+        DispatchQueue.main.async { result(true) }
+      } catch {
+        DispatchQueue.main.async {
+          result(FlutterError(code: "SWITCH_SESSION_FAILED", message: error.localizedDescription, details: error.localizedDescription))
         }
       }
     }

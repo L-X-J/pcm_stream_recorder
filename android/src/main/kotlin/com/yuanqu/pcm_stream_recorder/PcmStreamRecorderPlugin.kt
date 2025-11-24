@@ -5,6 +5,7 @@ import android.media.AudioAttributes
 import android.media.AudioFormat
 import android.media.AudioFocusRequest
 import android.media.AudioManager
+import android.media.AudioDeviceInfo
 import android.media.AudioRecord
 import android.media.MediaRecorder
 import android.media.audiofx.AcousticEchoCanceler
@@ -72,6 +73,7 @@ class PcmStreamRecorderPlugin : FlutterPlugin, MethodCallHandler, EventChannel.S
                     sampleRate = (args["sampleRate"] as? Number)?.toInt() ?: 16000,
                     channels = (args["channels"] as? Number)?.toInt() ?: 1,
                     bufferSize = (args["bufferSize"] as? Number)?.toInt() ?: 1600,
+                    useSystemAEC = (args["useSystemAEC"] as? Boolean) ?: false,
                     result = result
                 )
             }
@@ -105,6 +107,7 @@ class PcmStreamRecorderPlugin : FlutterPlugin, MethodCallHandler, EventChannel.S
         sampleRate: Int,
         channels: Int,
         bufferSize: Int,
+        useSystemAEC: Boolean,
         result: Result
     ) {
         if (isRecording) {
@@ -148,14 +151,40 @@ class PcmStreamRecorderPlugin : FlutterPlugin, MethodCallHandler, EventChannel.S
                 originalAudioMode = audioManager.mode
                 originalSpeakerphoneOn = audioManager.isSpeakerphoneOn
                 
-                // 使用 MODE_IN_COMMUNICATION 模式以支持边播边录
-                // 这个模式允许同时播放和录音，同时不会强制切换音频路由
-                // 系统会根据连接的设备（耳机、蓝牙等）自动选择正确的路由
                 try {
-                    audioManager.mode = AudioManager.MODE_IN_COMMUNICATION
-                    // 不强制设置扬声器，让系统自动处理
-                    // 如果检测到耳机，系统会自动路由到耳机，不会切换到扬声器或听筒
-                    android.util.Log.d("PcmStreamRecorder", "音频模式已设置为 MODE_IN_COMMUNICATION，支持边播边录，保持系统自动路由")
+                    if (useSystemAEC) {
+                        audioManager.mode = AudioManager.MODE_IN_COMMUNICATION
+                    } else {
+                        audioManager.mode = originalAudioMode
+                    }
+                    val outputs = audioManager.getDevices(AudioManager.GET_DEVICES_OUTPUTS)
+                    val hasSco = outputs.any { it.type == AudioDeviceInfo.TYPE_BLUETOOTH_SCO }
+                    val hasExternalOutput = outputs.any { device ->
+                        when (device.type) {
+                            AudioDeviceInfo.TYPE_WIRED_HEADPHONES,
+                            AudioDeviceInfo.TYPE_WIRED_HEADSET,
+                            AudioDeviceInfo.TYPE_BLUETOOTH_A2DP,
+                            AudioDeviceInfo.TYPE_USB_HEADSET,
+                            AudioDeviceInfo.TYPE_HEARING_AID -> true
+                            else -> false
+                        }
+                    } || hasSco
+                    if (hasExternalOutput) {
+                        if (audioManager.isSpeakerphoneOn) {
+                            audioManager.isSpeakerphoneOn = false
+                        }
+                        if (!hasSco && Build.VERSION.SDK_INT >= 34) {
+                            try {
+                                audioManager.clearCommunicationDevice()
+                            } catch (_: Exception) {}
+                        }
+                        android.util.Log.d("PcmStreamRecorder", "检测到外部输出设备，保持系统路由（耳机/蓝牙）")
+                    } else {
+                        if (!audioManager.isSpeakerphoneOn) {
+                            audioManager.isSpeakerphoneOn = true
+                        }
+                        android.util.Log.d("PcmStreamRecorder", "无外部输出设备，默认扬声器以避免走听筒")
+                    }
                 } catch (e: Exception) {
                     android.util.Log.w("PcmStreamRecorder", "设置音频模式失败: ${e.message}")
                 }
@@ -169,11 +198,12 @@ class PcmStreamRecorderPlugin : FlutterPlugin, MethodCallHandler, EventChannel.S
                 .setEncoding(audioFormat)
                 .setChannelMask(channelConfig)
             
-            // 使用 AudioSource.VOICE_COMMUNICATION 以支持回声消除和边播边录
-            // 这个源会自动配置合适的 AudioAttributes
             @Suppress("DEPRECATION")
             val audioRecord = AudioRecord.Builder()
-                .setAudioSource(MediaRecorder.AudioSource.VOICE_COMMUNICATION)
+                .setAudioSource(
+                    if (useSystemAEC) MediaRecorder.AudioSource.VOICE_COMMUNICATION
+                    else MediaRecorder.AudioSource.MIC
+                )
                 .setAudioFormat(audioFormatBuilder.build())
                 .setBufferSizeInBytes(recordBufferSize)
                 .build()
@@ -188,26 +218,21 @@ class PcmStreamRecorderPlugin : FlutterPlugin, MethodCallHandler, EventChannel.S
                 return
             }
             
-            // 启用回声消除（如果支持）
-            try {
-                if (AcousticEchoCanceler.isAvailable()) {
-                    val aec = AcousticEchoCanceler.create(audioRecord.audioSessionId)
-                    aec?.enabled = true
-                    acousticEchoCanceler = aec
-                }
-            } catch (e: Exception) {
-                // 忽略错误，某些设备可能不支持
-            }
-            
-            // 启用噪声抑制（如果支持）
-            try {
-                if (NoiseSuppressor.isAvailable()) {
-                    val ns = NoiseSuppressor.create(audioRecord.audioSessionId)
-                    ns?.enabled = true
-                    noiseSuppressor = ns
-                }
-            } catch (e: Exception) {
-                // 忽略错误，某些设备可能不支持
+            if (useSystemAEC) {
+                try {
+                    if (AcousticEchoCanceler.isAvailable()) {
+                        val aec = AcousticEchoCanceler.create(audioRecord.audioSessionId)
+                        aec?.enabled = true
+                        acousticEchoCanceler = aec
+                    }
+                } catch (_: Exception) {}
+                try {
+                    if (NoiseSuppressor.isAvailable()) {
+                        val ns = NoiseSuppressor.create(audioRecord.audioSessionId)
+                        ns?.enabled = true
+                        noiseSuppressor = ns
+                    }
+                } catch (_: Exception) {}
             }
             
             // 启动录音

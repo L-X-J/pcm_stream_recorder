@@ -232,6 +232,15 @@ class PcmStreamRecorder {
     }
   }
 
+  static Future<bool> switchToAsrSession() async {
+    try {
+      final result = await _methodChannel.invokeMethod<bool>('switchToAsrSession');
+      return result ?? false;
+    } catch (e) {
+      return false;
+    }
+  }
+
   /// 检查是否正在录音
   Future<bool> isRecording() async {
     try {
