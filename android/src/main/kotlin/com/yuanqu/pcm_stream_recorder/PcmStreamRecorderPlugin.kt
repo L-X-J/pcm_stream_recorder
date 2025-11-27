@@ -305,37 +305,48 @@ class PcmStreamRecorderPlugin : FlutterPlugin, MethodCallHandler, EventChannel.S
         recordingJob?.cancel()
         recordingJob = null
         
-        // 停止 AudioRecord
-        try {
-            audioRecord?.stop()
-            audioRecord?.release()
-        } catch (e: Exception) {
-            // 忽略错误
-        }
-        audioRecord = null
+        // 捕获当前引用，准备异步释放
+        val recordToRelease = audioRecord
+        val aecToRelease = acousticEchoCanceler
+        val nsToRelease = noiseSuppressor
         
-        // 释放音频效果器
-        try {
-            acousticEchoCanceler?.release()
-            noiseSuppressor?.release()
-        } catch (e: Exception) {
-            // 忽略错误
-        }
+        // 立即清空引用（主线程快速完成）
+        audioRecord = null
         acousticEchoCanceler = null
         noiseSuppressor = null
         
-        // 恢复音频管理器原始状态
-        // 使用协程延迟一小段时间，确保 AudioRecord 完全释放后再恢复
-        CoroutineScope(Dispatchers.Main).launch {
-            delay(100) // 延迟 100ms 确保资源完全释放
-            val audioManager = context?.getSystemService(Context.AUDIO_SERVICE) as? AudioManager
-            if (audioManager != null) {
-                try {
-                    audioManager.mode = originalAudioMode
-                    audioManager.isSpeakerphoneOn = originalSpeakerphoneOn
-                    android.util.Log.d("PcmStreamRecorder", "已恢复音频管理器原始状态: mode=$originalAudioMode, speakerphone=$originalSpeakerphoneOn")
-                } catch (e: Exception) {
-                    android.util.Log.w("PcmStreamRecorder", "恢复音频管理器状态失败: ${e.message}")
+        // 在子线程中执行耗时的释放操作，避免阻塞主线程
+        CoroutineScope(Dispatchers.IO).launch {
+            // 释放 AudioRecord（可能耗时 50-200ms）
+            try {
+                recordToRelease?.stop()
+                recordToRelease?.release()
+                android.util.Log.d("PcmStreamRecorder", "AudioRecord 已在后台释放")
+            } catch (e: Exception) {
+                android.util.Log.w("PcmStreamRecorder", "释放 AudioRecord 失败: ${e.message}")
+            }
+            
+            // 释放音频效果器
+            try {
+                aecToRelease?.release()
+                nsToRelease?.release()
+                android.util.Log.d("PcmStreamRecorder", "音频效果器已在后台释放")
+            } catch (e: Exception) {
+                android.util.Log.w("PcmStreamRecorder", "释放音频效果器失败: ${e.message}")
+            }
+            
+            // 延迟后恢复音频管理器状态（确保资源完全释放）
+            delay(100)
+            withContext(Dispatchers.Main) {
+                val audioManager = context?.getSystemService(Context.AUDIO_SERVICE) as? AudioManager
+                if (audioManager != null) {
+                    try {
+                        audioManager.mode = originalAudioMode
+                        audioManager.isSpeakerphoneOn = originalSpeakerphoneOn
+                        android.util.Log.d("PcmStreamRecorder", "已恢复音频管理器原始状态: mode=$originalAudioMode, speakerphone=$originalSpeakerphoneOn")
+                    } catch (e: Exception) {
+                        android.util.Log.w("PcmStreamRecorder", "恢复音频管理器状态失败: ${e.message}")
+                    }
                 }
             }
         }

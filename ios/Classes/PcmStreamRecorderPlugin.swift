@@ -578,21 +578,28 @@ public class PcmStreamRecorderPlugin: NSObject, FlutterPlugin {
       return
     }
     
+    // 立即标记停止状态
     isRecording = false
     sendCount = 0
     stopObservingRouteChanges()
+    
+    // 捕获引用
     let engine = audioEngine
     let node = inputNode
-    stopQueue.async { [weak self] in
-      guard let self = self else { return }
+    
+    // 立即清空引用（主线程快速完成）
+    self.audioEngine = nil
+    self.inputNode = nil
+    self.resamplePosition = 0.0
+    
+    // 立即返回结果给 Flutter，不等待资源释放
+    result(true)
+    
+    // 在后台队列异步释放资源，避免阻塞主线程
+    stopQueue.async {
       node?.removeTap(onBus: 0)
       engine?.stop()
-      self.audioEngine = nil
-      self.inputNode = nil
-      self.resamplePosition = 0.0
-      DispatchQueue.main.async {
-        result(true)
-      }
+      // 资源已释放，无需额外回调
     }
   }
 
