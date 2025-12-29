@@ -5,12 +5,15 @@ import android.media.AudioAttributes
 import android.media.AudioFormat
 import android.media.AudioFocusRequest
 import android.media.AudioManager
+import android.media.AudioDeviceCallback
 import android.media.AudioDeviceInfo
 import android.media.AudioRecord
 import android.media.MediaRecorder
 import android.media.audiofx.AcousticEchoCanceler
 import android.media.audiofx.NoiseSuppressor
 import android.os.Build
+import android.os.Handler
+import android.os.Looper
 import io.flutter.embedding.engine.plugins.FlutterPlugin
 import io.flutter.plugin.common.EventChannel
 import io.flutter.plugin.common.MethodCall
@@ -42,6 +45,9 @@ class PcmStreamRecorderPlugin : FlutterPlugin, MethodCallHandler, EventChannel.S
     // 音频效果器
     private var acousticEchoCanceler: AcousticEchoCanceler? = null
     private var noiseSuppressor: NoiseSuppressor? = null
+
+    // 音频设备回调 (API 23+)
+    private var audioDeviceCallback: AudioDeviceCallback? = null
     
     override fun onAttachedToEngine(flutterPluginBinding: FlutterPlugin.FlutterPluginBinding) {
         context = flutterPluginBinding.applicationContext
@@ -188,6 +194,22 @@ class PcmStreamRecorderPlugin : FlutterPlugin, MethodCallHandler, EventChannel.S
                 } catch (e: Exception) {
                     android.util.Log.w("PcmStreamRecorder", "设置音频模式失败: ${e.message}")
                 }
+
+                // 注册音频设备回调 (API 23+)
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
+                    audioDeviceCallback = object : AudioDeviceCallback() {
+                        override fun onAudioDevicesAdded(addedDevices: Array<out AudioDeviceInfo>?) {
+                            android.util.Log.d("PcmStreamRecorder", "检测到音频设备添加")
+                            updateAudioRouting(audioManager)
+                        }
+
+                        override fun onAudioDevicesRemoved(removedDevices: Array<out AudioDeviceInfo>?) {
+                            android.util.Log.d("PcmStreamRecorder", "检测到音频设备移除")
+                            updateAudioRouting(audioManager)
+                        }
+                    }
+                    audioManager.registerAudioDeviceCallback(audioDeviceCallback, Handler(Looper.getMainLooper()))
+                }
             }
             
             // 创建 AudioRecord (minSdk = 24，直接使用 AudioRecord.Builder)
@@ -314,6 +336,13 @@ class PcmStreamRecorderPlugin : FlutterPlugin, MethodCallHandler, EventChannel.S
         audioRecord = null
         acousticEchoCanceler = null
         noiseSuppressor = null
+
+        // 注销音频设备回调
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M && audioDeviceCallback != null) {
+            val audioManager = context?.getSystemService(Context.AUDIO_SERVICE) as? AudioManager
+            audioManager?.unregisterAudioDeviceCallback(audioDeviceCallback)
+            audioDeviceCallback = null
+        }
         
         // 在子线程中执行耗时的释放操作，避免阻塞主线程
         CoroutineScope(Dispatchers.IO).launch {
@@ -395,5 +424,42 @@ class PcmStreamRecorderPlugin : FlutterPlugin, MethodCallHandler, EventChannel.S
     
     override fun onCancel(arguments: Any?) {
         eventSink = null
+    }
+
+    // 动态更新音频路由
+    private fun updateAudioRouting(audioManager: AudioManager) {
+        try {
+            val outputs = audioManager.getDevices(AudioManager.GET_DEVICES_OUTPUTS)
+            val hasSco = outputs.any { it.type == AudioDeviceInfo.TYPE_BLUETOOTH_SCO }
+            val hasExternalOutput = outputs.any { device ->
+                when (device.type) {
+                    AudioDeviceInfo.TYPE_WIRED_HEADPHONES,
+                    AudioDeviceInfo.TYPE_WIRED_HEADSET,
+                    AudioDeviceInfo.TYPE_BLUETOOTH_A2DP,
+                    AudioDeviceInfo.TYPE_USB_HEADSET,
+                    AudioDeviceInfo.TYPE_HEARING_AID -> true
+                    else -> false
+                }
+            } || hasSco
+
+            if (hasExternalOutput) {
+                if (audioManager.isSpeakerphoneOn) {
+                    audioManager.isSpeakerphoneOn = false
+                }
+                if (!hasSco && Build.VERSION.SDK_INT >= 34) {
+                    try {
+                        audioManager.clearCommunicationDevice()
+                    } catch (_: Exception) {}
+                }
+                android.util.Log.d("PcmStreamRecorder", "路由变更：检测到外部输出，已关闭扬声器")
+            } else {
+                if (!audioManager.isSpeakerphoneOn) {
+                    audioManager.isSpeakerphoneOn = true
+                }
+                android.util.Log.d("PcmStreamRecorder", "路由变更：无外部输出，已开启扬声器")
+            }
+        } catch (e: Exception) {
+            android.util.Log.w("PcmStreamRecorder", "路由变更更新失败: ${e.message}")
+        }
     }
 }
