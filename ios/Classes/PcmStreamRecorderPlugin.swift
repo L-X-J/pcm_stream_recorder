@@ -597,8 +597,8 @@ public class PcmStreamRecorderPlugin: NSObject, FlutterPlugin {
     
     // 在后台队列异步释放资源，避免阻塞主线程
     stopQueue.async {
-      node?.removeTap(onBus: 0)
-      engine?.stop()
+       node?.removeTap(onBus: 0)
+       engine?.stop()
       // 资源已释放，无需额外回调
     }
   }
@@ -724,22 +724,43 @@ public class PcmStreamRecorderPlugin: NSObject, FlutterPlugin {
   }
 
   private func reconfigureInputTap() {
-    guard isRecording, let inputNode = inputNode else { return }
-    inputNode.removeTap(onBus: 0)
-    do {
-      try audioEngine?.start()
-    } catch {
-      audioEngine?.stop()
-      audioEngine?.reset()
-      do {
-        try audioEngine?.start()
-        log("已在路由变更后重启音频引擎")
-      } catch {
-        log("重启音频引擎失败: \(error.localizedDescription)")
-        return
-      }
+    guard isRecording else { return }
+    log("正在处理路由变更：开始重建音频引擎...")
+    
+    // 1. 销毁旧引擎
+    if let oldInput = inputNode {
+      oldInput.removeTap(onBus: 0)
     }
-    installTap(on: inputNode)
+    if let oldEngine = audioEngine {
+      if oldEngine.isRunning {
+        oldEngine.stop()
+      }
+      oldEngine.reset()
+    }
+    self.inputNode = nil
+    self.audioEngine = nil
+    
+    // 2. 创建新引擎
+    let newEngine = AVAudioEngine()
+    let newInputNode = newEngine.inputNode
+    
+    // 3. 安装 Tap (使用新的硬件格式)
+    // 重置重采样状态，避免因采样率突变导致计算错误
+    self.resamplePosition = 0.0
+    installTap(on: newInputNode)
+    
+    // 4. 启动新引擎
+    do {
+      try newEngine.start()
+      self.audioEngine = newEngine
+      self.inputNode = newInputNode
+      log("路由变更后引擎重建并启动成功")
+    } catch {
+      log("路由变更后引擎重建失败: \(error.localizedDescription)")
+      // 如果重建失败，尝试停止状态清理
+      // isRecording = false // 保持 isRecording 为 true 允许用户手动 retry 或看到错误？
+      // 还是保持现状比较好，不自动改状态，只是没声音了。
+    }
   }
 }
 
