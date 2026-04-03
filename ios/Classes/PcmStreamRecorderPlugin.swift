@@ -44,7 +44,14 @@ public class PcmStreamRecorderPlugin: NSObject, FlutterPlugin {
   }
   
   private static func desiredAsrOptions(for session: AVAudioSession) -> AVAudioSession.CategoryOptions {
-    var options: AVAudioSession.CategoryOptions = [.allowBluetooth]
+    // iOS 在 playAndRecord + voiceChat 下默认会把输出路由到听筒。
+    // 这里补上 defaultToSpeaker，让“未接耳机时的 ASR 场景”默认走扬声器，
+    // 同时仍然保留蓝牙耳机接入能力；一旦系统检测到有线/蓝牙耳机，路由仍会优先
+    // 交给外部输出设备，不会被 speaker 选项硬顶回外放。
+    var options: AVAudioSession.CategoryOptions = [
+      .allowBluetooth,
+      .defaultToSpeaker,
+    ]
     if savedOptions.contains(.mixWithOthers) || session.categoryOptions.contains(.mixWithOthers) {
       options.insert(.mixWithOthers)
     }

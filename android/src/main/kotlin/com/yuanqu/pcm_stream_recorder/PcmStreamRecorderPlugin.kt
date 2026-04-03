@@ -36,6 +36,7 @@ class PcmStreamRecorderPlugin : FlutterPlugin, MethodCallHandler, EventChannel.S
     private var context: Context? = null
     private var originalAudioMode: Int = AudioManager.MODE_NORMAL
     private var originalSpeakerphoneOn: Boolean = false
+    private var shouldRestoreMediaPlaybackState: Boolean = false
     
     // 录音配置
     private var sampleRate: Int = 16000
@@ -95,6 +96,12 @@ class PcmStreamRecorderPlugin : FlutterPlugin, MethodCallHandler, EventChannel.S
             "isRecording" -> {
                 result.success(isRecording)
             }
+            "prepareAudioSession" -> {
+                prepareAudioSession(result)
+            }
+            "restoreAudioSession" -> {
+                restoreAudioSession(result)
+            }
             else -> {
                 result.notImplemented()
             }
@@ -106,6 +113,67 @@ class PcmStreamRecorderPlugin : FlutterPlugin, MethodCallHandler, EventChannel.S
         // Android 权限检查需要 Flutter 侧处理
         // 这里返回 true，实际权限检查在 Flutter 侧使用 permission_handler
         return true
+    }
+
+    /// 记录进入 ASR 前的音频状态。
+    /// 这个准备阶段不主动切换路由，只负责把“媒体播放模式”的基线保存下来，
+    /// 方便页面退出或录音失败时回到正常的媒体扬声器链路。
+    private fun prepareAudioSession(result: Result) {
+        val audioManager = context?.getSystemService(Context.AUDIO_SERVICE) as? AudioManager
+        if (audioManager == null) {
+            result.error(
+                "AUDIO_MANAGER_NULL",
+                "无法获取 AudioManager",
+                null
+            )
+            return
+        }
+
+        try {
+            shouldRestoreMediaPlaybackState = false
+            originalAudioMode = audioManager.mode
+            originalSpeakerphoneOn = audioManager.isSpeakerphoneOn
+            android.util.Log.d(
+                "PcmStreamRecorder",
+                "已记录音频会话基线: mode=$originalAudioMode, speakerphone=$originalSpeakerphoneOn"
+            )
+            result.success(true)
+        } catch (e: Exception) {
+            result.error(
+                "PREPARE_AUDIO_SESSION_FAILED",
+                "记录音频会话基线失败: ${e.message}",
+                e.toString()
+            )
+        }
+    }
+
+    /// 恢复到媒体播放会话。
+    /// Android 上的“媒体扬声器”语义并不是简单恢复到旧状态，而是明确回到
+    /// `MODE_NORMAL + 非 speakerphone 通话路由`，让系统重新按媒体规则分发到
+    /// 内置扬声器或已连接耳机。这里既会立即执行一次，也会通知 stop 流程在
+    /// 异步释放录音资源后再次兜底，避免页面刚退出时还残留在通话链路。
+    private fun restoreAudioSession(result: Result) {
+        val audioManager = context?.getSystemService(Context.AUDIO_SERVICE) as? AudioManager
+        if (audioManager == null) {
+            result.error(
+                "AUDIO_MANAGER_NULL",
+                "无法获取 AudioManager",
+                null
+            )
+            return
+        }
+
+        try {
+            shouldRestoreMediaPlaybackState = true
+            restoreMediaPlaybackState(audioManager)
+            result.success(true)
+        } catch (e: Exception) {
+            result.error(
+                "RESTORE_AUDIO_SESSION_FAILED",
+                "恢复媒体播放会话失败: ${e.message}",
+                e.toString()
+            )
+        }
     }
     
     /// 开始录音
@@ -148,7 +216,7 @@ class PcmStreamRecorderPlugin : FlutterPlugin, MethodCallHandler, EventChannel.S
             )
             
             val recordBufferSize = maxOf(bufferSize * 2, minBufferSize * 2) // 16-bit = 2 bytes
-            
+
             // 保存并配置音频管理器，确保不会干扰系统的音频路由
             // 使用 MODE_IN_COMMUNICATION 以支持边播边录（播放视频同时录音）
             val audioManager = context?.getSystemService(Context.AUDIO_SERVICE) as? AudioManager
@@ -156,6 +224,7 @@ class PcmStreamRecorderPlugin : FlutterPlugin, MethodCallHandler, EventChannel.S
                 // 保存原始状态
                 originalAudioMode = audioManager.mode
                 originalSpeakerphoneOn = audioManager.isSpeakerphoneOn
+                shouldRestoreMediaPlaybackState = false
                 
                 try {
                     if (useSystemAEC) {
@@ -370,9 +439,17 @@ class PcmStreamRecorderPlugin : FlutterPlugin, MethodCallHandler, EventChannel.S
                 val audioManager = context?.getSystemService(Context.AUDIO_SERVICE) as? AudioManager
                 if (audioManager != null) {
                     try {
-                        audioManager.mode = originalAudioMode
-                        audioManager.isSpeakerphoneOn = originalSpeakerphoneOn
-                        android.util.Log.d("PcmStreamRecorder", "已恢复音频管理器原始状态: mode=$originalAudioMode, speakerphone=$originalSpeakerphoneOn")
+                        if (shouldRestoreMediaPlaybackState) {
+                            restoreMediaPlaybackState(audioManager)
+                            shouldRestoreMediaPlaybackState = false
+                        } else {
+                            audioManager.mode = originalAudioMode
+                            audioManager.isSpeakerphoneOn = originalSpeakerphoneOn
+                            android.util.Log.d(
+                                "PcmStreamRecorder",
+                                "已恢复音频管理器原始状态: mode=$originalAudioMode, speakerphone=$originalSpeakerphoneOn"
+                            )
+                        }
                     } catch (e: Exception) {
                         android.util.Log.w("PcmStreamRecorder", "恢复音频管理器状态失败: ${e.message}")
                     }
@@ -460,6 +537,47 @@ class PcmStreamRecorderPlugin : FlutterPlugin, MethodCallHandler, EventChannel.S
             }
         } catch (e: Exception) {
             android.util.Log.w("PcmStreamRecorder", "路由变更更新失败: ${e.message}")
+        }
+    }
+
+    /// 应用“媒体扬声器”会话。
+    /// 这里不强制打开 speakerphone，而是清理通信态残留后回到 `MODE_NORMAL`，
+    /// 让系统按媒体播放规则决定是走内置扬声器还是已连接耳机，并主动把
+    /// 音频焦点重新声明为媒体播放，减少刚退出 ASR 页面时还残留在通话态的概率。
+    private fun restoreMediaPlaybackState(audioManager: AudioManager) {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE) {
+            try {
+                audioManager.clearCommunicationDevice()
+            } catch (e: Exception) {
+                android.util.Log.w("PcmStreamRecorder", "清除通信设备失败: ${e.message}")
+            }
+        }
+
+        audioManager.mode = AudioManager.MODE_NORMAL
+        audioManager.isSpeakerphoneOn = false
+        val focusResult = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+            val audioAttributes = AudioAttributes.Builder()
+                .setUsage(AudioAttributes.USAGE_MEDIA)
+                .setContentType(AudioAttributes.CONTENT_TYPE_MUSIC)
+                .build()
+            val audioFocusRequest = AudioFocusRequest.Builder(AudioManager.AUDIOFOCUS_GAIN)
+                .setAudioAttributes(audioAttributes)
+                .build()
+            audioManager.requestAudioFocus(audioFocusRequest)
+        } else {
+            @Suppress("DEPRECATION")
+            audioManager.abandonAudioFocus(null)
+            @Suppress("DEPRECATION")
+            audioManager.requestAudioFocus(
+                null,
+                AudioManager.STREAM_MUSIC,
+                AudioManager.AUDIOFOCUS_GAIN
+            )
+        }
+        if (focusResult == AudioManager.AUDIOFOCUS_REQUEST_GRANTED) {
+            android.util.Log.d("PcmStreamRecorder", "已恢复到媒体播放会话（MODE_NORMAL + AUDIOFOCUS_GAIN）")
+        } else {
+            android.util.Log.w("PcmStreamRecorder", "媒体音频焦点请求未获授权，但已切回 MODE_NORMAL")
         }
     }
 }
