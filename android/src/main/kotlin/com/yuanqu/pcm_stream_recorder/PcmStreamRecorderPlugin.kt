@@ -15,6 +15,8 @@ import android.os.Build
 import android.os.Handler
 import android.os.Looper
 import io.flutter.embedding.engine.plugins.FlutterPlugin
+import io.flutter.embedding.engine.plugins.activity.ActivityAware
+import io.flutter.embedding.engine.plugins.activity.ActivityPluginBinding
 import io.flutter.plugin.common.EventChannel
 import io.flutter.plugin.common.MethodCall
 import io.flutter.plugin.common.MethodChannel
@@ -25,7 +27,7 @@ import kotlinx.coroutines.*
 /** 高性能原生录音插件 - Android 实现
  * 使用 AudioRecord 实现录音，支持边播边录和回声消除
  */
-class PcmStreamRecorderPlugin : FlutterPlugin, MethodCallHandler, EventChannel.StreamHandler {
+class PcmStreamRecorderPlugin : FlutterPlugin, MethodCallHandler, EventChannel.StreamHandler, ActivityAware {
     private lateinit var methodChannel: MethodChannel
     private lateinit var eventChannel: EventChannel
     private var eventSink: EventChannel.EventSink? = null
@@ -49,6 +51,7 @@ class PcmStreamRecorderPlugin : FlutterPlugin, MethodCallHandler, EventChannel.S
 
     // 音频设备回调 (API 23+)
     private var audioDeviceCallback: AudioDeviceCallback? = null
+    private var playbackAudioCapturePlugin: PlaybackAudioCapturePlugin? = null
     
     override fun onAttachedToEngine(flutterPluginBinding: FlutterPlugin.FlutterPluginBinding) {
         context = flutterPluginBinding.applicationContext
@@ -57,12 +60,34 @@ class PcmStreamRecorderPlugin : FlutterPlugin, MethodCallHandler, EventChannel.S
         
         eventChannel = EventChannel(flutterPluginBinding.binaryMessenger, "pcm_stream_recorder/audio_stream")
         eventChannel.setStreamHandler(this)
+        playbackAudioCapturePlugin = PlaybackAudioCapturePlugin(
+            flutterPluginBinding.applicationContext,
+            flutterPluginBinding.binaryMessenger
+        )
     }
     
     override fun onDetachedFromEngine(binding: FlutterPlugin.FlutterPluginBinding) {
         methodChannel.setMethodCallHandler(null)
         eventChannel.setStreamHandler(null)
+        playbackAudioCapturePlugin?.dispose()
+        playbackAudioCapturePlugin = null
         stopRecordingInternal()
+    }
+
+    override fun onAttachedToActivity(binding: ActivityPluginBinding) {
+        playbackAudioCapturePlugin?.onAttachedToActivity(binding)
+    }
+
+    override fun onDetachedFromActivityForConfigChanges() {
+        playbackAudioCapturePlugin?.onDetachedFromActivityForConfigChanges()
+    }
+
+    override fun onReattachedToActivityForConfigChanges(binding: ActivityPluginBinding) {
+        playbackAudioCapturePlugin?.onReattachedToActivityForConfigChanges(binding)
+    }
+
+    override fun onDetachedFromActivity() {
+        playbackAudioCapturePlugin?.onDetachedFromActivity()
     }
     
     override fun onMethodCall(call: MethodCall, result: Result) {

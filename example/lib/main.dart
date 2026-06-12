@@ -42,15 +42,20 @@ class _RecorderExamplePageState extends State<RecorderExamplePage> {
 
   StreamSubscription<Uint8List>? _audioSubscription;
   StreamSubscription<PlayerState>? _playerStateSubscription;
+  StreamSubscription<PlaybackAudioPower>? _playbackPowerSubscription;
 
   bool _hasPermission = false;
   bool _isRecording = false;
   bool _isPaused = false;
   bool _isPlaying = false;
   bool _isSaving = false;
+  bool _isPlaybackCaptureSupported = false;
+  bool _isPlaybackCapturing = false;
   double _audioLevel = 0;
+  PlaybackAudioPower? _playbackPower;
   String? _lastFilePath;
   String? _errorMessage;
+  String? _playbackCaptureError;
 
   static const int _sampleRate = 16000;
   static const int _channels = 1;
@@ -60,6 +65,7 @@ class _RecorderExamplePageState extends State<RecorderExamplePage> {
   void initState() {
     super.initState();
     _initPermissions();
+    _initPlaybackCaptureSupport();
     _playerStateSubscription = _audioPlayer.onPlayerStateChanged.listen((
       PlayerState state,
     ) {
@@ -73,6 +79,8 @@ class _RecorderExamplePageState extends State<RecorderExamplePage> {
   void dispose() {
     _audioSubscription?.cancel();
     _playerStateSubscription?.cancel();
+    _playbackPowerSubscription?.cancel();
+    PlaybackAudioCapture.stop();
     _audioPlayer.dispose();
     _recorder.dispose();
     super.dispose();
@@ -98,6 +106,16 @@ class _RecorderExamplePageState extends State<RecorderExamplePage> {
       _showSnackBar('需要麦克风权限才能录音');
     }
     return granted;
+  }
+
+  Future<void> _initPlaybackCaptureSupport() async {
+    final supported = await PlaybackAudioCapture.isSupported();
+    if (!mounted) {
+      return;
+    }
+    setState(() {
+      _isPlaybackCaptureSupported = supported;
+    });
   }
 
   Future<void> _startRecording() async {
@@ -236,6 +254,74 @@ class _RecorderExamplePageState extends State<RecorderExamplePage> {
       _showSnackBar('开始播放');
     } catch (e) {
       _showSnackBar('播放失败: $e');
+    }
+  }
+
+  Future<void> _startPlaybackCapture() async {
+    if (_isPlaybackCapturing) {
+      return;
+    }
+
+    await _playbackPowerSubscription?.cancel();
+    _playbackPowerSubscription = PlaybackAudioCapture.powerStream.listen(
+      (power) {
+        setState(() {
+          _playbackPower = power;
+          _isPlaybackCapturing = power.capturing;
+          _playbackCaptureError = null;
+        });
+      },
+      onError: (Object error) {
+        setState(() {
+          _playbackCaptureError = '播放音频捕获流错误: $error';
+          _isPlaybackCapturing = false;
+        });
+      },
+      cancelOnError: false,
+    );
+
+    try {
+      final started = await PlaybackAudioCapture.startPowerCapture(
+        sampleRate: _sampleRate,
+        channels: _channels,
+        frameMs: 100,
+      );
+      setState(() {
+        _isPlaybackCapturing = started;
+        _playbackCaptureError = null;
+      });
+      if (started) {
+        _showSnackBar('播放音频捕获已开始');
+      }
+    } catch (e) {
+      setState(() {
+        _playbackCaptureError = '启动播放音频捕获失败: $e';
+        _isPlaybackCapturing = false;
+      });
+      _showSnackBar('启动播放音频捕获失败');
+    }
+  }
+
+  Future<void> _stopPlaybackCapture() async {
+    final stopped = await PlaybackAudioCapture.stop();
+    setState(() {
+      _isPlaybackCapturing = false;
+      _playbackPower = _playbackPower == null
+          ? null
+          : const PlaybackAudioPower(
+              source: '',
+              rms: 0,
+              db: -160,
+              linearPower: 0,
+              duty: 0,
+              sampleRate: _sampleRate,
+              channels: _channels,
+              capturing: false,
+              message: 'stopped',
+            );
+    });
+    if (stopped) {
+      _showSnackBar('播放音频捕获已停止');
     }
   }
 
@@ -396,16 +482,14 @@ class _RecorderExamplePageState extends State<RecorderExamplePage> {
                   label: const Text('停止'),
                 ),
                 ElevatedButton.icon(
-                  onPressed: _isRecording && !_isPaused
-                      ? _pauseRecording
-                      : null,
+                  onPressed:
+                      _isRecording && !_isPaused ? _pauseRecording : null,
                   icon: const Icon(Icons.pause),
                   label: const Text('暂停'),
                 ),
                 ElevatedButton.icon(
-                  onPressed: _isRecording && _isPaused
-                      ? _resumeRecording
-                      : null,
+                  onPressed:
+                      _isRecording && _isPaused ? _resumeRecording : null,
                   icon: const Icon(Icons.play_arrow),
                   label: const Text('恢复'),
                 ),
@@ -417,6 +501,91 @@ class _RecorderExamplePageState extends State<RecorderExamplePage> {
                   label: Text(_isPlaying ? '停止播放' : '播放录音'),
                 ),
               ],
+            ),
+            const SizedBox(height: 24),
+            Text('播放音频捕获', style: Theme.of(context).textTheme.titleMedium),
+            const SizedBox(height: 8),
+            Card(
+              child: Padding(
+                padding: const EdgeInsets.all(16),
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    Row(
+                      children: [
+                        Icon(
+                          _isPlaybackCaptureSupported
+                              ? Icons.graphic_eq
+                              : Icons.block,
+                          color: _isPlaybackCaptureSupported
+                              ? Colors.green
+                              : Colors.grey,
+                        ),
+                        const SizedBox(width: 8),
+                        Expanded(
+                          child: Text(
+                            _isPlaybackCaptureSupported
+                                ? (_isPlaybackCapturing
+                                    ? '正在捕获播放音频'
+                                    : '可捕获播放音频')
+                                : '当前平台不支持播放音频捕获',
+                            style: Theme.of(context).textTheme.titleSmall,
+                          ),
+                        ),
+                      ],
+                    ),
+                    const SizedBox(height: 16),
+                    LinearProgressIndicator(
+                      value: _playbackPower?.linearPower ?? 0,
+                      minHeight: 10,
+                      backgroundColor: Colors.grey.shade300,
+                      valueColor: AlwaysStoppedAnimation<Color>(
+                        _isPlaybackCapturing ? Colors.orange : Colors.blueGrey,
+                      ),
+                    ),
+                    const SizedBox(height: 12),
+                    Text('source: ${_playbackPower?.source ?? '-'}'),
+                    Text(
+                        'rms: ${(_playbackPower?.rms ?? 0).toStringAsFixed(4)}'),
+                    Text(
+                        'db: ${(_playbackPower?.db ?? -160).toStringAsFixed(2)}'),
+                    Text(
+                        'duty: ${(_playbackPower?.duty ?? 0).toStringAsFixed(1)}'),
+                    Text('message: ${_playbackPower?.message ?? '-'}'),
+                    if (_playbackCaptureError != null) ...[
+                      const SizedBox(height: 12),
+                      Text(
+                        _playbackCaptureError!,
+                        style: TextStyle(
+                          color: Theme.of(context).colorScheme.error,
+                        ),
+                      ),
+                    ],
+                    const SizedBox(height: 16),
+                    Wrap(
+                      spacing: 12,
+                      runSpacing: 12,
+                      children: [
+                        ElevatedButton.icon(
+                          onPressed: _isPlaybackCaptureSupported &&
+                                  !_isPlaybackCapturing
+                              ? _startPlaybackCapture
+                              : null,
+                          icon: const Icon(Icons.hearing),
+                          label: const Text('开始捕获'),
+                        ),
+                        ElevatedButton.icon(
+                          onPressed: _isPlaybackCapturing
+                              ? _stopPlaybackCapture
+                              : null,
+                          icon: const Icon(Icons.stop_circle),
+                          label: const Text('停止捕获'),
+                        ),
+                      ],
+                    ),
+                  ],
+                ),
+              ),
             ),
             const SizedBox(height: 24),
             Text('最近一次录音文件', style: Theme.of(context).textTheme.titleMedium),

@@ -5,6 +5,7 @@ import AVFoundation
 /// 轻量级原生录音插件 - iOS 实现
 /// 使用 AVAudioEngine 实现 PCM 实时回调与 WAV 文件录制
 public class PcmStreamRecorderPlugin: NSObject, FlutterPlugin {
+  private static var playbackAudioCapturePlugin: PlaybackAudioCapturePlugin?
   private var methodChannel: FlutterMethodChannel?
   private var eventChannel: FlutterEventChannel?
   private var eventSink: FlutterEventSink?
@@ -161,6 +162,7 @@ public class PcmStreamRecorderPlugin: NSObject, FlutterPlugin {
   
   public static func register(with registrar: FlutterPluginRegistrar) {
     let instance = PcmStreamRecorderPlugin()
+    playbackAudioCapturePlugin = PlaybackAudioCapturePlugin(registrar: registrar)
     
     // MethodChannel 用于方法调用
     let methodChannel = FlutterMethodChannel(

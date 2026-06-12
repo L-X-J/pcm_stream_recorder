@@ -2,6 +2,8 @@ import 'dart:async';
 
 import 'package:flutter/services.dart';
 
+export 'playback_audio_capture.dart';
+
 /// 轻量级原生录音插件
 /// 提供 PCM 实时回调与 WAV 文件录制能力
 class PcmStreamRecorder {
@@ -207,7 +209,8 @@ class PcmStreamRecorder {
 
   static Future<bool> deactivateSession() async {
     try {
-      final result = await _methodChannel.invokeMethod<bool>('deactivateSession');
+      final result =
+          await _methodChannel.invokeMethod<bool>('deactivateSession');
       return result ?? false;
     } catch (e) {
       return false;
@@ -216,7 +219,8 @@ class PcmStreamRecorder {
 
   static Future<bool> prepareAudioSession() async {
     try {
-      final result = await _methodChannel.invokeMethod<bool>('prepareAudioSession');
+      final result =
+          await _methodChannel.invokeMethod<bool>('prepareAudioSession');
       return result ?? false;
     } catch (e) {
       return false;
@@ -225,7 +229,8 @@ class PcmStreamRecorder {
 
   static Future<bool> restoreAudioSession() async {
     try {
-      final result = await _methodChannel.invokeMethod<bool>('restoreAudioSession');
+      final result =
+          await _methodChannel.invokeMethod<bool>('restoreAudioSession');
       return result ?? false;
     } catch (e) {
       return false;
@@ -234,7 +239,8 @@ class PcmStreamRecorder {
 
   static Future<bool> switchToAsrSession() async {
     try {
-      final result = await _methodChannel.invokeMethod<bool>('switchToAsrSession');
+      final result =
+          await _methodChannel.invokeMethod<bool>('switchToAsrSession');
       return result ?? false;
     } catch (e) {
       return false;
