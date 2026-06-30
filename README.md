@@ -20,6 +20,23 @@
 
 该链路面向 ASR、IM 语音、AEC 等录麦场景，输出原始 16-bit PCM。
 
+### iOS 音频会话边界
+
+iOS 录音链路在 `prepareAudioSession()` / `switchToAsrSession()` 中统一切到 `playAndRecord + voiceChat`，用于支持边播边录与回声抑制场景。插件层负责音频路由策略：
+
+- 检测到有线耳机、蓝牙耳机、USB 音频或车载音频时，不启用 `defaultToSpeaker`，清除输出覆盖并允许 HFP 与 A2DP 蓝牙路由。
+- 未检测到外部输出设备时，启用 `defaultToSpeaker` 并显式 `overrideOutputAudioPort(.speaker)`，避免 ASR 会话默认走听筒。
+- 路由变化时会刷新 ASR 会话选项、重新应用输出策略并重建输入 tap，业务层不应在页面或 service 中重复强制切换扬声器。
+
+### Android 音频会话边界
+
+Android ASR 在启用系统 AEC 时会进入 `MODE_IN_COMMUNICATION + VOICE_COMMUNICATION`，插件层负责避免通信模式污染媒体播放路由：
+
+- 检测到有线耳机、蓝牙耳机、BLE 耳机、USB 音频或助听设备时，关闭 `speakerphone`。
+- Android 12+ 会优先通过 `setCommunicationDevice()` 指向可用外部通信设备；无可指定设备时清理 communication device，把媒体输出交还系统路由。
+- 未检测到外部输出设备时才启用 `speakerphone`，避免通信模式默认走听筒。
+- 录音启动后和音频设备热插拔时都会重新应用同一套路由策略。
+
 ### 快速上手
 
 1. **安装依赖**

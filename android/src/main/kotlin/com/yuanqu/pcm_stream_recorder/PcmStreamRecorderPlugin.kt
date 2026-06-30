@@ -52,6 +52,181 @@ class PcmStreamRecorderPlugin : FlutterPlugin, MethodCallHandler, EventChannel.S
     // 音频设备回调 (API 23+)
     private var audioDeviceCallback: AudioDeviceCallback? = null
     private var playbackAudioCapturePlugin: PlaybackAudioCapturePlugin? = null
+
+    /**
+     * 判断设备类型是否代表用户显式接入的外部音频路由。
+     *
+     * 该判断只服务 ASR 边播边录路由：外部耳机存在时必须关闭扬声器路由，避免
+     * 详情页启动 `MODE_IN_COMMUNICATION` 后视频声音被系统切到手机外放。
+     */
+    private fun isExternalAudioDeviceType(type: Int): Boolean {
+        return when (type) {
+            AudioDeviceInfo.TYPE_WIRED_HEADPHONES,
+            AudioDeviceInfo.TYPE_WIRED_HEADSET,
+            AudioDeviceInfo.TYPE_BLUETOOTH_A2DP,
+            AudioDeviceInfo.TYPE_BLUETOOTH_SCO,
+            AudioDeviceInfo.TYPE_USB_HEADSET,
+            AudioDeviceInfo.TYPE_USB_DEVICE,
+            AudioDeviceInfo.TYPE_USB_ACCESSORY,
+            AudioDeviceInfo.TYPE_HEARING_AID -> true
+            AudioDeviceInfo.TYPE_BLE_HEADSET,
+            AudioDeviceInfo.TYPE_BLE_SPEAKER -> Build.VERSION.SDK_INT >= Build.VERSION_CODES.S
+            else -> false
+        }
+    }
+
+    /**
+     * 判断输出设备是否是外部播放设备。
+     *
+     * `GET_DEVICES_OUTPUTS` 已经限定了输出方向，因此这里不再依赖 `isSink`。部分
+     * Android 厂商 ROM 在通信模式切换期间会给设备方向返回不稳定状态，继续检查
+     * `isSink` 会误判“无耳机”，进而错误打开扬声器。
+     */
+    private fun isExternalOutputDevice(device: AudioDeviceInfo): Boolean {
+        return isExternalAudioDeviceType(device.type)
+    }
+
+    /**
+     * 使用旧路由开关作为设备枚举失败时的兜底。
+     *
+     * 这些 API 已被标记废弃，但在部分 Android 机型上比设备列表更早反映耳机连接
+     * 状态；只用作“禁止打开 speakerphone”的保护信号，不作为最终输出选择。
+     */
+    @Suppress("DEPRECATION")
+    private fun hasLegacyExternalRouteSignal(audioManager: AudioManager): Boolean {
+        return audioManager.isBluetoothA2dpOn ||
+            audioManager.isBluetoothScoOn ||
+            audioManager.isWiredHeadsetOn
+    }
+
+    /**
+     * 判断系统当前是否存在任何外部音频路由。
+     *
+     * Android 在媒体输出、通信输出和旧路由状态之间存在时序差异；只要任一路径
+     * 表明耳机存在，就不应该打开 speakerphone。
+     */
+    private fun hasExternalAudioRoute(audioManager: AudioManager): Boolean {
+        val outputs = audioManager.getDevices(AudioManager.GET_DEVICES_OUTPUTS)
+        if (outputs.any { isExternalOutputDevice(it) }) {
+            return true
+        }
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S &&
+            audioManager.availableCommunicationDevices.any { isExternalAudioDeviceType(it.type) }
+        ) {
+            return true
+        }
+        return hasLegacyExternalRouteSignal(audioManager)
+    }
+
+    /**
+     * 生成路由快照日志，便于真机复测时确认系统枚举到了哪些设备。
+     */
+    @Suppress("DEPRECATION")
+    private fun describeAudioRoute(audioManager: AudioManager): String {
+        val outputs = audioManager.getDevices(AudioManager.GET_DEVICES_OUTPUTS)
+            .joinToString(prefix = "[", postfix = "]") { "${it.type}:${it.productName}" }
+        val communicationDevices = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+            audioManager.availableCommunicationDevices
+                .joinToString(prefix = "[", postfix = "]") { "${it.type}:${it.productName}" }
+        } else {
+            "[]"
+        }
+        val currentCommunicationDevice = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+            audioManager.communicationDevice?.let { "${it.type}:${it.productName}" } ?: "null"
+        } else {
+            "null"
+        }
+        return "mode=${audioManager.mode}, speaker=${audioManager.isSpeakerphoneOn}, " +
+            "a2dp=${audioManager.isBluetoothA2dpOn}, sco=${audioManager.isBluetoothScoOn}, " +
+            "wired=${audioManager.isWiredHeadsetOn}, outputs=$outputs, " +
+            "communication=$communicationDevices, currentCommunication=$currentCommunicationDevice"
+    }
+
+    /**
+     * 为通信音频路由排序。
+     *
+     * ASR 使用系统 AEC 时会进入通信模式；Android 12+ 需要优先指定通信设备，
+     * 否则系统可能沿用 speakerphone。带麦的有线/蓝牙设备优先级最高，纯媒体
+     * 输出作为兜底交给系统媒体路由处理。
+     */
+    private fun communicationRoutePriority(device: AudioDeviceInfo): Int {
+        return when (device.type) {
+            AudioDeviceInfo.TYPE_WIRED_HEADSET -> 0
+            AudioDeviceInfo.TYPE_BLUETOOTH_SCO -> 1
+            AudioDeviceInfo.TYPE_BLE_HEADSET -> 2
+            AudioDeviceInfo.TYPE_USB_HEADSET -> 3
+            AudioDeviceInfo.TYPE_HEARING_AID -> 4
+            AudioDeviceInfo.TYPE_WIRED_HEADPHONES -> 5
+            AudioDeviceInfo.TYPE_BLUETOOTH_A2DP -> 6
+            AudioDeviceInfo.TYPE_BLE_SPEAKER -> 7
+            AudioDeviceInfo.TYPE_USB_DEVICE -> 8
+            else -> 100
+        }
+    }
+
+    /**
+     * 选择 Android 12+ 可用的外部通信设备。
+     *
+     * `getDevices(GET_DEVICES_OUTPUTS)` 能说明“有耳机”，但通信模式真正使用的是
+     * `availableCommunicationDevices`；两者必须分开看，避免把 A2DP 输出误当成可
+     * 直接指定的通话设备。
+     */
+    private fun findPreferredCommunicationDevice(audioManager: AudioManager): AudioDeviceInfo? {
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.S) {
+            return null
+        }
+        return audioManager.availableCommunicationDevices
+            .filter { isExternalAudioDeviceType(it.type) }
+            .minByOrNull { communicationRoutePriority(it) }
+    }
+
+    /**
+     * 应用 ASR 录音期间的播放路由策略。
+     *
+     * 有外部输出时关闭 speakerphone，并在 Android 12+ 显式指定或清理通信设备；
+     * 无外部输出时才启用扬声器，避免通信模式默认落到听筒。该函数在启动录音和
+     * 设备热插拔时复用，保证详情页 ASR 与视频播放走同一套系统路由规则。
+     */
+    private fun applyAsrAudioRouting(audioManager: AudioManager) {
+        val hasExternalOutput = hasExternalAudioRoute(audioManager)
+        android.util.Log.d("PcmStreamRecorder", "ASR路由快照: ${describeAudioRoute(audioManager)}")
+
+        if (hasExternalOutput) {
+            if (audioManager.isSpeakerphoneOn) {
+                audioManager.isSpeakerphoneOn = false
+            }
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+                val preferredDevice = findPreferredCommunicationDevice(audioManager)
+                if (preferredDevice != null) {
+                    val currentDevice = audioManager.communicationDevice
+                    if (currentDevice?.id != preferredDevice.id) {
+                        val routed = audioManager.setCommunicationDevice(preferredDevice)
+                        android.util.Log.d(
+                            "PcmStreamRecorder",
+                            "检测到外部输出，设置通信设备: type=${preferredDevice.type}, routed=$routed"
+                        )
+                    } else {
+                        android.util.Log.d(
+                            "PcmStreamRecorder",
+                            "检测到外部输出，通信设备已是外部设备: type=${preferredDevice.type}"
+                        )
+                    }
+                } else {
+                    audioManager.clearCommunicationDevice()
+                    android.util.Log.d("PcmStreamRecorder", "检测到外部输出，清理通信设备并交还系统路由")
+                }
+            }
+            android.util.Log.d("PcmStreamRecorder", "检测到外部输出设备，已关闭扬声器路由")
+        } else {
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+                audioManager.clearCommunicationDevice()
+            }
+            if (!audioManager.isSpeakerphoneOn) {
+                audioManager.isSpeakerphoneOn = true
+            }
+            android.util.Log.d("PcmStreamRecorder", "无外部输出设备，默认扬声器以避免走听筒")
+        }
+    }
     
     override fun onAttachedToEngine(flutterPluginBinding: FlutterPlugin.FlutterPluginBinding) {
         context = flutterPluginBinding.applicationContext
@@ -257,34 +432,7 @@ class PcmStreamRecorderPlugin : FlutterPlugin, MethodCallHandler, EventChannel.S
                     } else {
                         audioManager.mode = originalAudioMode
                     }
-                    val outputs = audioManager.getDevices(AudioManager.GET_DEVICES_OUTPUTS)
-                    val hasSco = outputs.any { it.type == AudioDeviceInfo.TYPE_BLUETOOTH_SCO }
-                    val hasExternalOutput = outputs.any { device ->
-                        when (device.type) {
-                            AudioDeviceInfo.TYPE_WIRED_HEADPHONES,
-                            AudioDeviceInfo.TYPE_WIRED_HEADSET,
-                            AudioDeviceInfo.TYPE_BLUETOOTH_A2DP,
-                            AudioDeviceInfo.TYPE_USB_HEADSET,
-                            AudioDeviceInfo.TYPE_HEARING_AID -> true
-                            else -> false
-                        }
-                    } || hasSco
-                    if (hasExternalOutput) {
-                        if (audioManager.isSpeakerphoneOn) {
-                            audioManager.isSpeakerphoneOn = false
-                        }
-                        if (!hasSco && Build.VERSION.SDK_INT >= 34) {
-                            try {
-                                audioManager.clearCommunicationDevice()
-                            } catch (_: Exception) {}
-                        }
-                        android.util.Log.d("PcmStreamRecorder", "检测到外部输出设备，保持系统路由（耳机/蓝牙）")
-                    } else {
-                        if (!audioManager.isSpeakerphoneOn) {
-                            audioManager.isSpeakerphoneOn = true
-                        }
-                        android.util.Log.d("PcmStreamRecorder", "无外部输出设备，默认扬声器以避免走听筒")
-                    }
+                    applyAsrAudioRouting(audioManager)
                 } catch (e: Exception) {
                     android.util.Log.w("PcmStreamRecorder", "设置音频模式失败: ${e.message}")
                 }
@@ -353,6 +501,16 @@ class PcmStreamRecorderPlugin : FlutterPlugin, MethodCallHandler, EventChannel.S
             
             // 启动录音
             audioRecord.startRecording()
+
+            // AudioRecord 启动后部分系统才会刷新 availableCommunicationDevices，
+            // 因此这里再应用一次路由策略，避免详情页首帧视频声音短暂落到外放。
+            if (audioManager != null) {
+                try {
+                    applyAsrAudioRouting(audioManager)
+                } catch (e: Exception) {
+                    android.util.Log.w("PcmStreamRecorder", "启动录音后更新音频路由失败: ${e.message}")
+                }
+            }
             
             this.audioRecord = audioRecord
             this.isRecording = true
@@ -528,38 +686,15 @@ class PcmStreamRecorderPlugin : FlutterPlugin, MethodCallHandler, EventChannel.S
         eventSink = null
     }
 
-    // 动态更新音频路由
+    /**
+     * 动态更新音频路由。
+     *
+     * 设备热插拔时复用启动录音时的路由策略，避免耳机连接状态变化后仍保留
+     * Android 通信模式中的 speakerphone 或旧 communication device。
+     */
     private fun updateAudioRouting(audioManager: AudioManager) {
         try {
-            val outputs = audioManager.getDevices(AudioManager.GET_DEVICES_OUTPUTS)
-            val hasSco = outputs.any { it.type == AudioDeviceInfo.TYPE_BLUETOOTH_SCO }
-            val hasExternalOutput = outputs.any { device ->
-                when (device.type) {
-                    AudioDeviceInfo.TYPE_WIRED_HEADPHONES,
-                    AudioDeviceInfo.TYPE_WIRED_HEADSET,
-                    AudioDeviceInfo.TYPE_BLUETOOTH_A2DP,
-                    AudioDeviceInfo.TYPE_USB_HEADSET,
-                    AudioDeviceInfo.TYPE_HEARING_AID -> true
-                    else -> false
-                }
-            } || hasSco
-
-            if (hasExternalOutput) {
-                if (audioManager.isSpeakerphoneOn) {
-                    audioManager.isSpeakerphoneOn = false
-                }
-                if (!hasSco && Build.VERSION.SDK_INT >= 34) {
-                    try {
-                        audioManager.clearCommunicationDevice()
-                    } catch (_: Exception) {}
-                }
-                android.util.Log.d("PcmStreamRecorder", "路由变更：检测到外部输出，已关闭扬声器")
-            } else {
-                if (!audioManager.isSpeakerphoneOn) {
-                    audioManager.isSpeakerphoneOn = true
-                }
-                android.util.Log.d("PcmStreamRecorder", "路由变更：无外部输出，已开启扬声器")
-            }
+            applyAsrAudioRouting(audioManager)
         } catch (e: Exception) {
             android.util.Log.w("PcmStreamRecorder", "路由变更更新失败: ${e.message}")
         }
@@ -570,7 +705,7 @@ class PcmStreamRecorderPlugin : FlutterPlugin, MethodCallHandler, EventChannel.S
     /// 让系统按媒体播放规则决定是走内置扬声器还是已连接耳机，并主动把
     /// 音频焦点重新声明为媒体播放，减少刚退出 ASR 页面时还残留在通话态的概率。
     private fun restoreMediaPlaybackState(audioManager: AudioManager) {
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE) {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
             try {
                 audioManager.clearCommunicationDevice()
             } catch (e: Exception) {

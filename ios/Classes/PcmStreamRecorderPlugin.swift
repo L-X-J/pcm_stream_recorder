@@ -44,19 +44,64 @@ public class PcmStreamRecorderPlugin: NSObject, FlutterPlugin {
     savedPreferredSampleRate = session.preferredSampleRate
   }
   
+  /// 判断端口是否代表用户显式接入的外部听音设备。
+  ///
+  /// 该判断只服务 ASR 会话路由策略：外部设备存在时不能启用
+  /// `defaultToSpeaker`，否则详情页边播边录可能把视频声音顶回手机外放。
+  private static func isExternalAudioPort(_ portType: AVAudioSession.Port) -> Bool {
+    switch portType {
+    case .headphones,
+      .headsetMic,
+      .bluetoothA2DP,
+      .bluetoothHFP,
+      .bluetoothLE,
+      .carAudio,
+      .usbAudio:
+      return true
+    default:
+      return false
+    }
+  }
+
+  /// 检测当前音频会话是否已有或可用外部路由。
+  ///
+  /// 除了 currentRoute，也检查 availableInputs；因为切换到 playAndRecord 前，
+  /// 蓝牙耳机常以可用输入出现，若只看当前输出会误判为无耳机。
+  private static func hasExternalAudioRoute(_ session: AVAudioSession) -> Bool {
+    let routedPorts = session.currentRoute.outputs + session.currentRoute.inputs
+    if routedPorts.contains(where: { isExternalAudioPort($0.portType) }) {
+      return true
+    }
+    return session.availableInputs?.contains(where: { isExternalAudioPort($0.portType) }) ?? false
+  }
+
   private static func desiredAsrOptions(for session: AVAudioSession) -> AVAudioSession.CategoryOptions {
-    // iOS 在 playAndRecord + voiceChat 下默认会把输出路由到听筒。
-    // 这里补上 defaultToSpeaker，让“未接耳机时的 ASR 场景”默认走扬声器，
-    // 同时仍然保留蓝牙耳机接入能力；一旦系统检测到有线/蓝牙耳机，路由仍会优先
-    // 交给外部输出设备，不会被 speaker 选项硬顶回外放。
+    // iOS 在 playAndRecord + voiceChat 下默认可能把输出路由到听筒；未接外部设备时
+    // 才允许 defaultToSpeaker。耳机/蓝牙存在时保留系统外部路由，避免详情页启动 ASR
+    // 后把视频声音从耳机切到手机扬声器。
     var options: AVAudioSession.CategoryOptions = [
-      .allowBluetooth,
-      .defaultToSpeaker,
+      .allowBluetoothHFP,
+      .allowBluetoothA2DP,
     ]
+    if !hasExternalAudioRoute(session) {
+      options.insert(.defaultToSpeaker)
+    }
     if savedOptions.contains(.mixWithOthers) || session.categoryOptions.contains(.mixWithOthers) {
       options.insert(.mixWithOthers)
     }
     return options
+  }
+
+  /// 应用 ASR 期间的输出路由偏好。
+  ///
+  /// 无耳机时显式覆盖到扬声器，避免 `playAndRecord + voiceChat` 默认落到听筒；
+  /// 有耳机/蓝牙/USB 等外部路由时清除覆盖，把选择权交还给系统和用户当前路由。
+  private static func applyAsrOutputRoutePreference(_ session: AVAudioSession) throws {
+    if hasExternalAudioRoute(session) {
+      try session.overrideOutputAudioPort(.none)
+    } else {
+      try session.overrideOutputAudioPort(.speaker)
+    }
   }
   
   private static func options(_ current: AVAudioSession.CategoryOptions, include target: AVAudioSession.CategoryOptions) -> Bool {
@@ -74,7 +119,12 @@ public class PcmStreamRecorderPlugin: NSObject, FlutterPlugin {
     
     let alreadyCategory = session.category == .playAndRecord
     let alreadyMode = session.mode == .voiceChat
-    let optionsSatisfied = options(session.categoryOptions, include: targetOptions)
+    // defaultToSpeaker 是路由敏感选项：外部设备接入时必须允许它被移除，
+    // 不能只用“目标 options 是否被包含”来判断会话已满足要求。
+    let speakerRouteOptionSatisfied =
+      session.categoryOptions.contains(.defaultToSpeaker) == targetOptions.contains(.defaultToSpeaker)
+    let optionsSatisfied = options(session.categoryOptions, include: targetOptions) &&
+      speakerRouteOptionSatisfied
     let rateSatisfied = sampleRateMatches(session.preferredSampleRate, target: targetSampleRate)
     
     if alreadyCategory && alreadyMode && optionsSatisfied && rateSatisfied {
@@ -88,6 +138,28 @@ public class PcmStreamRecorderPlugin: NSObject, FlutterPlugin {
       try session.setPreferredSampleRate(targetSampleRate)
     }
     return true
+  }
+
+  /// 路由变化后刷新 ASR 会话偏好。
+  ///
+  /// 耳机热插拔期间 input tap 会重建；在重建前同步刷新 category options，
+  /// 让新的播放/录音链路按最新外部设备状态选择输出端。
+  private static func refreshAsrRoutePreference(completion: (() -> Void)? = nil) {
+    sessionQueue.async {
+      let audioSession = AVAudioSession.sharedInstance()
+      do {
+        _ = try configureAsrSessionIfNeeded(audioSession)
+        try audioSession.setActive(true, options: activationOptions(for: audioSession))
+        try applyAsrOutputRoutePreference(audioSession)
+      } catch {
+        print("[PcmStreamRecorder] refresh ASR audio route failed: \(error.localizedDescription)")
+      }
+      if let completion = completion {
+        DispatchQueue.main.async {
+          completion()
+        }
+      }
+    }
   }
   
   private static func activationOptions(for session: AVAudioSession) -> AVAudioSession.SetActiveOptions {
@@ -110,7 +182,10 @@ public class PcmStreamRecorderPlugin: NSObject, FlutterPlugin {
     ) { [weak self] _ in
       DispatchQueue.main.asyncAfter(deadline: .now() + 0.15) {
         guard let self = self, self.isRecording else { return }
-        self.reconfigureInputTap()
+        PcmStreamRecorderPlugin.refreshAsrRoutePreference { [weak self] in
+          guard let self = self, self.isRecording else { return }
+          self.reconfigureInputTap()
+        }
       }
     }
   }
@@ -630,10 +705,9 @@ public class PcmStreamRecorderPlugin: NSObject, FlutterPlugin {
     sessionQueue.async {
       let audioSession = AVAudioSession.sharedInstance()
       do {
-        let changed = try configureAsrSessionIfNeeded(audioSession)
-        if changed {
-          try audioSession.setActive(true, options: activationOptions(for: audioSession))
-        }
+        _ = try configureAsrSessionIfNeeded(audioSession)
+        try audioSession.setActive(true, options: activationOptions(for: audioSession))
+        try applyAsrOutputRoutePreference(audioSession)
         DispatchQueue.main.async { result(true) }
       } catch {
         DispatchQueue.main.async {
@@ -647,6 +721,9 @@ public class PcmStreamRecorderPlugin: NSObject, FlutterPlugin {
     sessionQueue.async {
       let audioSession = AVAudioSession.sharedInstance()
       do {
+        // ASR 会话可能在无耳机时显式覆盖到扬声器；恢复原会话前先清掉覆盖，
+        // 避免后续非 ASR 播放继续继承强制扬声器策略。
+        try? audioSession.overrideOutputAudioPort(.none)
         try audioSession.setActive(false, options: .notifyOthersOnDeactivation)
         if let category = savedCategory {
           let mode = savedMode ?? .default
@@ -684,10 +761,9 @@ public class PcmStreamRecorderPlugin: NSObject, FlutterPlugin {
     sessionQueue.async {
       let audioSession = AVAudioSession.sharedInstance()
       do {
-        let changed = try configureAsrSessionIfNeeded(audioSession)
-        if changed {
-          try audioSession.setActive(true, options: activationOptions(for: audioSession))
-        }
+        _ = try configureAsrSessionIfNeeded(audioSession)
+        try audioSession.setActive(true, options: activationOptions(for: audioSession))
+        try applyAsrOutputRoutePreference(audioSession)
         DispatchQueue.main.async { result(true) }
       } catch {
         DispatchQueue.main.async {
